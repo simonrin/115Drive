@@ -1,0 +1,48 @@
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="115Drive 设置" Width="800" Height="610" MinWidth="710" MinHeight="530" WindowStartupLocation="CenterScreen" Background="#FFFFFF" FontFamily="Microsoft YaHei UI" FontSize="13" UseLayoutRounding="True">
+ <Window.Resources>
+  <Style TargetType="Button"><Setter Property="Cursor" Value="Hand"/><Setter Property="Padding" Value="15,9"/><Setter Property="Margin" Value="0,0,8,0"/><Setter Property="Background" Value="#EDF2F9"/><Setter Property="Foreground" Value="#253954"/><Setter Property="BorderThickness" Value="0"/><Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button"><Border x:Name="Surface" Background="{TemplateBinding Background}" CornerRadius="6" Padding="{TemplateBinding Padding}"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border><ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Surface" Property="Opacity" Value="0.82"/></Trigger><Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value="0.45"/></Trigger></ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter></Style>
+  <Style TargetType="TextBlock"><Setter Property="Foreground" Value="#26364D"/><Setter Property="TextWrapping" Value="Wrap"/></Style>
+  <Style x:Key="Note" TargetType="TextBlock"><Setter Property="Foreground" Value="#788597"/><Setter Property="FontSize" Value="12"/><Setter Property="TextWrapping" Value="Wrap"/><Setter Property="LineHeight" Value="20"/></Style>
+  <Style x:Key="Card" TargetType="Border"><Setter Property="BorderBrush" Value="#E6EAF0"/><Setter Property="BorderThickness" Value="1"/><Setter Property="CornerRadius" Value="9"/><Setter Property="Padding" Value="18"/><Setter Property="Margin" Value="0,0,0,16"/></Style>
+ </Window.Resources>
+ <Grid Background="#FFFFFF">
+  <Grid.ColumnDefinitions><ColumnDefinition Width="180"/><ColumnDefinition/></Grid.ColumnDefinitions>
+  <Border Background="#F4F6FA" BorderBrush="#E5E9EF" BorderThickness="0,0,1,0">
+   <DockPanel Margin="18,25,10,18">
+    <StackPanel DockPanel.Dock="Top" Margin="5,0,0,28"><TextBlock Text="115Drive" FontSize="22" FontWeight="SemiBold"/><TextBlock Text="设置" Foreground="#7C899A" Margin="0,5,0,0"/></StackPanel>
+    <TextBlock DockPanel.Dock="Bottom" Text="文件随你，安心同步" Style="{StaticResource Note}" Margin="5,0,0,0"/>
+    <StackPanel><Button x:Name="SyncNav" Content="同步与备份" HorizontalContentAlignment="Left" Margin="0,0,0,8"/><Button x:Name="AccountNav" Content="账户" Margin="0,0,0,8"/><Button x:Name="AboutNav" Content="关于" Margin="0,0,0,8"/></StackPanel>
+   </DockPanel>
+  </Border>
+  <Grid Grid.Column="1" Margin="28,24,28,18">
+   <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+   <StackPanel Margin="0,0,0,18"><TextBlock x:Name="SettingsTitle" Text="同步与备份" FontSize="25" FontWeight="SemiBold"/><TextBlock x:Name="SettingsSubtitle" Text="管理这台电脑上的文件与同步偏好" Style="{StaticResource Note}" Margin="0,8,0,0"/></StackPanel>
+   <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+    <Grid>
+     <StackPanel x:Name="SyncPage">
+      <Border Style="{StaticResource Card}"><StackPanel><TextBlock Text="同步文件夹" FontSize="15" FontWeight="SemiBold"/><TextBlock x:Name="LocalFolderLabel" Text="正在读取…" Margin="0,10,0,5"/><TextBlock Text="对应 115 网盘 /115Drive" Style="{StaticResource Note}"/>
+       <StackPanel Orientation="Horizontal" Margin="0,14,0,0"><Button x:Name="SettingsOpenFolder" Content="打开文件夹"/><Button x:Name="ChangeFolderButton" Content="更改位置"/></StackPanel>
+       <StackPanel x:Name="FolderEditor" Visibility="Collapsed" Margin="0,16,0,0"><TextBlock Text="新位置（空文件夹或尚未创建的文件夹）" Style="{StaticResource Note}"/><TextBox x:Name="NewFolderPath" Padding="10" Margin="0,7,0,10" FontSize="12"/><StackPanel Orientation="Horizontal"><Button x:Name="BrowseFolderButton" Content="浏览…"/><Button x:Name="CheckFolderButton" Content="检查目标"/><Button x:Name="ApplyFolderButton" Content="复制并切换" Background="#176BEB" Foreground="White" IsEnabled="False"/></StackPanel>
+        <TextBlock x:Name="FolderResult" Style="{StaticResource Note}" Margin="0,12,0,0"/>
+        <ProgressBar x:Name="FolderProgress" Height="5" Margin="0,12,0,0" Visibility="Collapsed" Foreground="#176BEB"/>
+        <Button x:Name="CancelFolderButton" Content="取消更改" Visibility="Collapsed" HorizontalAlignment="Left" Margin="0,10,0,0"/>
+        <TextBlock Text="复制并校验后切换；旧目录保留为副本。复制期间请关闭正在编辑的同步文件。" Style="{StaticResource Note}" Margin="0,12,0,0"/>
+       </StackPanel>
+      </StackPanel></Border>
+      <Border Style="{StaticResource Card}"><StackPanel><TextBlock Text="同步偏好" FontSize="15" FontWeight="SemiBold"/><CheckBox x:Name="StartupCheck" Content="登录 Windows 时自动启动 115Drive" Margin="0,16,0,14"/><DockPanel><Button x:Name="SettingsPauseButton" Content="暂停同步" DockPanel.Dock="Right" HorizontalAlignment="Right"/><TextBlock x:Name="SyncStateLabel" Text="正在读取状态…" VerticalAlignment="Center" Margin="0,0,12,0"/></DockPanel></StackPanel></Border>
+      <TextBlock Text="恢复副本已关闭，删除和覆盖会同步到另一端。已有副本保留；同时修改产生的冲突版本仍会单独保留。" Style="{StaticResource Note}"/>
+     </StackPanel>
+     <StackPanel x:Name="AccountPage" Visibility="Collapsed">
+      <Border Style="{StaticResource Card}"><StackPanel><TextBlock Text="115 网盘" FontSize="18" FontWeight="SemiBold"/><TextBlock x:Name="AccountStateLabel" Text="正在读取连接状态…" Margin="0,10,0,12"/><TextBlock Text="使用手机 115 生活 App 扫码连接。无需保持官方客户端后台运行。" Style="{StaticResource Note}"/><StackPanel Orientation="Horizontal" Margin="0,16,0,0"><Button x:Name="NativeLoginButton" Content="扫码连接" Background="#176BEB" Foreground="White"/><Button x:Name="NativeCancelLogin" Content="取消扫码" Visibility="Collapsed"/><Button x:Name="PauseForLogin" Content="暂停以重新连接" Visibility="Collapsed"/></StackPanel>
+       <Image x:Name="LoginQrImage" Width="190" Height="190" HorizontalAlignment="Left" Visibility="Collapsed" Margin="0,16,0,0"/>
+       <TextBlock x:Name="LoginMessage" Style="{StaticResource Note}" Margin="0,14,0,0"/>
+      </StackPanel></Border>
+      <TextBlock Text="登录凭据仅保存在本机受限目录。普通网盘会话可能失效，届时需重新扫码；扫码可能替换已有的微信小程序会话。连接验证会在独立测试目录检查同步，再启用自动同步。" Style="{StaticResource Note}"/>
+     </StackPanel>
+     <StackPanel x:Name="AboutPage" Visibility="Collapsed"><TextBlock Text="115Drive" FontSize="32" FontWeight="SemiBold" Margin="0,5,0,10"/><TextBlock Text="版本 0.2.0 · Windows x64" Margin="0,0,0,20"/><TextBlock Text="面向 115 网盘的本地双向同步工具。&#10;原生托盘、文件同步进度与设置窗口。" Margin="0,0,0,20"/><Border Style="{StaticResource Card}"><StackPanel><TextBlock Text="由 OpenList 与 rclone 提供同步能力" FontWeight="SemiBold"/><TextBlock Text="社区项目，非 115 官方客户端。支持完整本地副本，不提供按需下载占位符。" Style="{StaticResource Note}" Margin="0,10,0,14"/><Button x:Name="OpenRecoveryButton" Content="打开本机恢复目录" HorizontalAlignment="Left"/></StackPanel></Border><TextBlock x:Name="DataFolderLabel" Style="{StaticResource Note}"/></StackPanel>
+    </Grid>
+   </ScrollViewer>
+   <TextBlock x:Name="SettingsNotice" Grid.Row="2" Style="{StaticResource Note}" Margin="0,14,0,0" MaxHeight="60"/>
+  </Grid>
+ </Grid>
+</Window>

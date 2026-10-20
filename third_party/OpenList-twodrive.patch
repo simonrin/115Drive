@@ -1,0 +1,2861 @@
+--- a/OpenList-4.2.6/drivers/115/driver.go
++++ b/OpenList-4.2.6/drivers/115/driver.go
+@@ -18,9 +18,10 @@
+ type Pan115 struct {
+ 	model.Storage
+ 	Addition
+-	client     *driver115.Pan115Client
+-	limiter    *rate.Limiter
+-	appVerOnce sync.Once
++	client       *driver115.Pan115Client
++	limiter      *rate.Limiter
++	appVerOnce   sync.Once
++	startupCache *verifiedStartupCache
+ }
+ 
+ func (d *Pan115) Config() driver.Config {
+@@ -32,6 +33,7 @@
+ }
+ 
+ func (d *Pan115) Init(ctx context.Context) error {
++	d.startupCache = newVerifiedStartupCache()
+ 	d.appVerOnce.Do(d.initAppVer)
+ 	if d.LimitRate > 0 {
+ 		d.limiter = rate.NewLimiter(rate.Limit(d.LimitRate), 1)
+@@ -51,6 +53,9 @@
+ }
+ 
+ func (d *Pan115) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
++	if files, ok := d.restoreVerifiedDirectory(dir.GetID(), args.Refresh); ok {
++		return files, nil
++	}
+ 	if err := d.WaitLimit(ctx); err != nil {
+ 		return nil, err
+ 	}
+@@ -76,10 +81,14 @@
+ 		URL:    downloadInfo.Url.Url,
+ 		Header: downloadInfo.Header,
+ 	}
++	if err = d.resumableLink(file, link, userAgent); err != nil {
++		return nil, err
++	}
+ 	return link, nil
+ }
+ 
+ func (d *Pan115) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) (model.Obj, error) {
++	d.disableStartupCache()
+ 	if err := d.WaitLimit(ctx); err != nil {
+ 		return nil, err
+ 	}
+@@ -108,6 +117,7 @@
+ }
+ 
+ func (d *Pan115) Move(ctx context.Context, srcObj, dstDir model.Obj) (model.Obj, error) {
++	d.disableStartupCache()
+ 	if err := d.WaitLimit(ctx); err != nil {
+ 		return nil, err
+ 	}
+@@ -122,6 +132,7 @@
+ }
+ 
+ func (d *Pan115) Rename(ctx context.Context, srcObj model.Obj, newName string) (model.Obj, error) {
++	d.disableStartupCache()
+ 	if err := d.WaitLimit(ctx); err != nil {
+ 		return nil, err
+ 	}
+@@ -136,6 +147,7 @@
+ }
+ 
+ func (d *Pan115) Copy(ctx context.Context, srcObj, dstDir model.Obj) error {
++	d.disableStartupCache()
+ 	if err := d.WaitLimit(ctx); err != nil {
+ 		return err
+ 	}
+@@ -143,6 +155,7 @@
+ }
+ 
+ func (d *Pan115) Remove(ctx context.Context, obj model.Obj) error {
++	d.disableStartupCache()
+ 	if err := d.WaitLimit(ctx); err != nil {
+ 		return err
+ 	}
+@@ -150,6 +163,7 @@
+ }
+ 
+ func (d *Pan115) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) (model.Obj, error) {
++	d.disableStartupCache()
+ 	if err := d.WaitLimit(ctx); err != nil {
+ 		return nil, err
+ 	}
+@@ -191,6 +205,9 @@
+ 		}
+ 	}
+ 	fullHash = strings.ToUpper(fullHash)
++	if d.transferIdentity() != "" && stream.GetSize() > 10*utils.MB {
++		return d.resumableUpload(ctx, stream, dirID, preHash, fullHash, up)
++	}
+ 
+ 	// rapid-upload
+ 	// note that 115 add timeout for rapid-upload,
+--- a/OpenList-4.2.6/drivers/115/meta.go
++++ b/OpenList-4.2.6/drivers/115/meta.go
+@@ -18,6 +18,9 @@
+ 	Name:          "115 Cloud",
+ 	DefaultRoot:   "0",
+ 	LinkCacheMode: driver.LinkCacheUA,
++	// 115 creates another file on same-name uploads. Use OpenList's existing
++	// rename/upload/remove transaction (rollback on failure) for WebDAV PUT.
++	NoOverwriteUpload: true,
+ }
+ 
+ func init() {
+--- a/OpenList-4.2.6/drivers/115/startup_cache.go
++++ b/OpenList-4.2.6/drivers/115/startup_cache.go
+@@ -0,0 +1,137 @@
++package _115
++
++// TwoDrive's private instance can seed its empty memory cache from a complete
++// directory + SHA1 manifest revalidated AFTER this driver started. This is a
++// one-shot bootstrap, not an alternate persistent source of filesystem truth.
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"os"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/OpenListTeam/OpenList/v4/internal/model"
++	driver115 "github.com/SheltonZhu/115driver/pkg/driver"
++	log "github.com/sirupsen/logrus"
++)
++
++type verifiedDirectory struct {
++	Path string               `json:"path"`
++	Rows []driver115.FileInfo `json:"rows"`
++}
++
++type verifiedIndex struct {
++	Version      int                          `json:"version"`
++	Remote       string                       `json:"remote"`
++	RootID       string                       `json:"root_id"`
++	Identity     string                       `json:"identity"`
++	CheckedAt    float64                      `json:"checked_at"`
++	TreeVerified bool                         `json:"tree_verified"`
++	Dirs         map[string]verifiedDirectory `json:"dirs"`
++}
++
++type verifiedStartupCache struct {
++	mu       sync.Mutex
++	path     string
++	started  time.Time
++	modified time.Time
++	size     int64
++	index    *verifiedIndex
++	used     map[string]bool
++	disabled bool
++	restored int
++}
++
++func newVerifiedStartupCache() *verifiedStartupCache {
++	return &verifiedStartupCache{path: os.Getenv("TWODRIVE_VERIFIED_INDEX"), started: time.Now(), used: make(map[string]bool)}
++}
++
++func (d *Pan115) disableStartupCache() {
++	c := d.startupCache
++	if c == nil {
++		return
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if !c.disabled && c.restored > 0 {
++		log.Infof("TwoDrive startup cache restored %d directories; bootstrap closed before mutation", c.restored)
++	}
++	c.disabled = true
++	c.index = nil
++}
++
++func (d *Pan115) restoreVerifiedDirectory(cid string, refresh bool) ([]model.Obj, bool) {
++	c := d.startupCache
++	if c == nil || c.path == "" || d.MountPath != "/115" || d.Remark != "Managed by TwoDrive" {
++		return nil, false
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.disabled || c.used[cid] {
++		return nil, false
++	}
++	// Explicit fresh listings and previously listed directories always retain the
++	// original driver's behavior. Never resurrect a stale entry after invalidation.
++	if refresh {
++		c.used[cid] = true
++		return nil, false
++	}
++	st, err := os.Stat(c.path)
++	if err != nil || st.Size() > 64*1024*1024 {
++		return nil, false
++	}
++	if c.index == nil || st.ModTime() != c.modified || st.Size() != c.size {
++		data, err := os.ReadFile(c.path)
++		if err != nil {
++			return nil, false
++		}
++		var idx verifiedIndex
++		if json.Unmarshal(data, &idx) != nil {
++			return nil, false
++		}
++		c.index = &idx
++		c.modified, c.size = st.ModTime(), st.Size()
++	}
++	idx := c.index
++	identity := sha256.Sum256([]byte(fmt.Sprint(d.Storage.ID) + d.Cookie))
++	checked := time.Unix(0, int64(idx.CheckedAt*1e9))
++	if idx.Version != 2 || idx.Remote != "cloud115:115Drive" || !idx.TreeVerified ||
++		idx.Identity != hex.EncodeToString(identity[:]) || checked.Before(c.started) ||
++		time.Since(checked) < 0 || time.Since(checked) > 120*time.Second ||
++		idx.Dirs[idx.RootID].Path != "115Drive" {
++		return nil, false
++	}
++	dir, ok := idx.Dirs[cid]
++	if !ok || !(dir.Path == "115Drive" || strings.HasPrefix(dir.Path, "115Drive/")) {
++		return nil, false
++	}
++	files := make([]model.Obj, 0, len(dir.Rows))
++	names := make(map[string]bool)
++	for _, row := range dir.Rows {
++		name := strings.ToLower(row.Name)
++		if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/\\") || names[name] {
++			return nil, false
++		}
++		names[name] = true
++		f := (&driver115.File{}).From(&row)
++		if f.FileID == "" || f.ParentID != cid {
++			return nil, false
++		}
++		if !f.IsDirectory {
++			sha, err := hex.DecodeString(f.Sha1)
++			if err != nil || len(sha) != 20 || f.PickCode == "" || f.Size < 0 {
++				return nil, false
++			}
++		}
++		files = append(files, &FileObj{File: *f})
++	}
++	c.used[cid] = true
++	c.restored++
++	if c.restored == 1 {
++		log.Info("TwoDrive verified startup cache available")
++	}
++	return files, true
++}
+--- a/OpenList-4.2.6/drivers/115/startup_cache_test.go
++++ b/OpenList-4.2.6/drivers/115/startup_cache_test.go
+@@ -0,0 +1,85 @@
++package _115
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/OpenListTeam/OpenList/v4/internal/model"
++)
++
++func testStartupDriver(t *testing.T) (*Pan115, map[string]any, func()) {
++	t.Helper()
++	path := filepath.Join(t.TempDir(), "index.json")
++	t.Setenv("TWODRIVE_VERIFIED_INDEX", path)
++	d := &Pan115{Storage: model.Storage{ID: 1, MountPath: "/115", Remark: "Managed by TwoDrive"}}
++	d.Cookie = "test-cookie"
++	d.startupCache = newVerifiedStartupCache()
++	d.startupCache.started = time.Now().Add(-time.Second)
++	h := sha256.Sum256([]byte("1test-cookie"))
++	idx := map[string]any{"version": 2, "remote": "cloud115:115Drive", "root_id": "1", "identity": hex.EncodeToString(h[:]), "tree_verified": true, "checked_at": float64(time.Now().UnixMilli()) / 1000,
++		"dirs": map[string]any{"1": map[string]any{"path": "115Drive", "rows": []any{map[string]any{"fid": "10", "cid": "1", "n": "test.txt", "s": 7, "sha": "0123456789012345678901234567890123456789", "pc": "download-code", "tp": 100, "t": "2026-10-20 10:00"}}}}}
++	write := func() {
++		data, err := json.Marshal(idx)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if err = os.WriteFile(path, data, 0600); err != nil {
++			t.Fatal(err)
++		}
++	}
++	write()
++	return d, idx, write
++}
++
++func TestTwoDriveVerifiedStartupRestoresTypedFilesOnce(t *testing.T) {
++	d, _, _ := testStartupDriver(t)
++	rows, ok := d.restoreVerifiedDirectory("1", false)
++	if !ok || len(rows) != 1 {
++		t.Fatal("did not restore complete directory")
++	}
++	f, ok := rows[0].(*FileObj)
++	if !ok || f.PickCode != "download-code" || f.ParentID != "1" || f.Size != 7 {
++		t.Fatal("driver identity/download fields lost")
++	}
++	if _, ok = d.restoreVerifiedDirectory("1", false); ok {
++		t.Fatal("restored twice after potential invalidation")
++	}
++}
++
++func TestTwoDriveVerifiedStartupRejectsUnsafeSnapshots(t *testing.T) {
++	for _, mode := range []string{"old-process", "expired", "future", "wrong-account", "legacy", "unverified", "other-root", "refresh", "mutation"} {
++		t.Run(mode, func(t *testing.T) {
++			d, idx, write := testStartupDriver(t)
++			switch mode {
++			case "old-process":
++				d.startupCache.started = time.Now().Add(time.Second)
++			case "expired":
++				idx["checked_at"] = float64(time.Now().Add(-3 * time.Minute).Unix())
++				d.startupCache.started = time.Now().Add(-time.Hour)
++			case "future":
++				idx["checked_at"] = float64(time.Now().Add(time.Minute).Unix())
++			case "wrong-account":
++				d.Cookie = "another-account"
++			case "legacy":
++				idx["version"] = 1
++			case "unverified":
++				idx["tree_verified"] = false
++			case "other-root":
++				idx["remote"] = "cloud115:other"
++			case "refresh":
++				d.restoreVerifiedDirectory("1", true)
++			case "mutation":
++				d.disableStartupCache()
++			}
++			write()
++			if _, ok := d.restoreVerifiedDirectory("1", false); ok {
++				t.Fatal("unsafe snapshot accepted")
++			}
++		})
++	}
++}
+--- a/OpenList-4.2.6/drivers/115/twodrive_parts_test.go
++++ b/OpenList-4.2.6/drivers/115/twodrive_parts_test.go
+@@ -0,0 +1,41 @@
++package _115
++
++import (
++	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
++	"testing"
++)
++
++func TestTwoDriveLargerUploadParts(t *testing.T) {
++	sizes := []int64{1, 10*utils.MB + 1, 128 * utils.MB, 8 * utils.GB,
++		8 * utils.MB * 9999, 8 * utils.MB * 10000, 256 * utils.GB, 1024 * utils.GB}
++	for _, size := range sizes {
++		parts, err := SplitFile(size)
++		if err != nil {
++			t.Fatalf("size %d: %v", size, err)
++		}
++		if len(parts) == 0 || len(parts) > 9999 {
++			t.Fatalf("size %d: invalid parts %d", size, len(parts))
++		}
++		var offset int64
++		for index, part := range parts {
++			if part.Offset != offset || part.Number != index+1 || part.Size <= 0 {
++				t.Fatalf("size %d: discontinuity in part %d", size, index)
++			}
++			if index < len(parts)-1 && part.Size < 100*utils.KB {
++				t.Fatal("nonfinal part too small")
++			}
++			offset += part.Size
++		}
++		if offset != size {
++			t.Fatalf("size %d: covered %d", size, offset)
++		}
++		if size == 128*utils.MB && len(parts) != 16 {
++			t.Fatalf("128MiB has %d parts", len(parts))
++		}
++	}
++	for _, size := range []int64{0, -1} {
++		if _, err := SplitFile(size); err == nil {
++			t.Fatalf("accepted invalid size %d", size)
++		}
++	}
++}
+--- a/OpenList-4.2.6/drivers/115/twodrive_resume.go
++++ b/OpenList-4.2.6/drivers/115/twodrive_resume.go
+@@ -0,0 +1,360 @@
++package _115
++
++import (
++	"context"
++	"crypto/md5"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"os"
++	"strconv"
++	"strings"
++	"time"
++
++	"github.com/OpenListTeam/OpenList/v4/internal/driver"
++	"github.com/OpenListTeam/OpenList/v4/internal/model"
++	netutil "github.com/OpenListTeam/OpenList/v4/internal/net"
++	resume "github.com/OpenListTeam/OpenList/v4/internal/twodrive_resume"
++	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
++	driver115 "github.com/SheltonZhu/115driver/pkg/driver"
++	"github.com/aliyun/aliyun-oss-go-sdk/oss"
++)
++
++func (d *Pan115) transferIdentity() string {
++	if os.Getenv("TWODRIVE_RESUME") == "" || d.MountPath != "/115" || d.Remark != "Managed by TwoDrive" {
++		return ""
++	}
++	for _, field := range strings.Split(d.Cookie, ";") {
++		k, v, ok := strings.Cut(strings.TrimSpace(field), "=")
++		if ok && k == "UID" && v != "" {
++			return resume.Key(strconv.FormatUint(uint64(d.ID), 10), d.RootFolderID, strings.Split(v, "_")[0])
++		}
++	}
++	return ""
++}
++
++func getResumeStore() (*resume.Store, error) {
++	return resume.EnvironmentStore()
++}
++
++func (d *Pan115) resumableLink(file model.Obj, link *model.Link, userAgent string) error {
++	identity := d.transferIdentity()
++	hash := strings.ToUpper(file.GetHash().GetHash(utils.SHA1))
++	if identity == "" || !twoDriveUserAgent(userAgent) || file.GetSize() < 16<<20 || len(hash) != 40 {
++		return nil
++	}
++	s, err := getResumeStore()
++	if err != nil {
++		return err
++	}
++	key := resume.Key(identity, file.GetID(), hash, strconv.FormatInt(file.GetSize(), 10))
++	url := link.URL
++	header := link.Header.Clone()
++	if header == nil {
++		header = make(http.Header)
++	}
++	header.Set("User-Agent", userAgent)
++	link.RangeReader = &resume.Download{
++		Store: s, Key: key, Size: file.GetSize(),
++		Progress: resume.NewProgress(s, userAgent, key, file.GetName(), "download", file.GetSize()),
++		Fetch: func(ctx context.Context, start, length int64) (io.ReadCloser, error) {
++			h := header.Clone()
++			h.Set("Range", fmt.Sprintf("bytes=%d-%d", start, start+length-1))
++			h.Set("Accept-Encoding", "identity")
++			response, err := netutil.RequestHttp(ctx, "GET", h, url)
++			if err != nil {
++				return nil, err
++			}
++			// A 200 response would silently redownload the prefix. Refuse it.
++			expected := fmt.Sprintf("bytes %d-%d/%d", start, start+length-1, file.GetSize())
++			if response.StatusCode != http.StatusPartialContent || response.Header.Get("Content-Range") != expected {
++				response.Body.Close()
++				return nil, fmt.Errorf("download server did not honor the requested resume range")
++			}
++			return response.Body, nil
++		},
++	}
++	return nil
++}
++
++func twoDriveUserAgent(ua string) bool {
++	return strings.HasPrefix(ua, "TwoDrive/") || strings.Contains(ua, " TwoDrive/")
++}
++
++type uploadCheckpoint struct {
++	Version     int                               `json:"version"`
++	Key         string                            `json:"key"`
++	Updated     int64                             `json:"updated"`
++	Size        int64                             `json:"size"`
++	SHA1        string                            `json:"sha1"`
++	Params      driver115.UploadOSSParams         `json:"params"`
++	Session     oss.InitiateMultipartUploadResult `json:"session"`
++	Parts       []oss.UploadPart                  `json:"parts"`
++	PartSize    int64                             `json:"part_size"`
++	ReusedBytes int64                             `json:"reused_bytes"`
++	SentBytes   int64                             `json:"sent_bytes"`
++}
++
++type multipartBackend interface {
++	Initiate(context.Context, *driver115.UploadOSSParams) (oss.InitiateMultipartUploadResult, error)
++	List(context.Context, oss.InitiateMultipartUploadResult) ([]oss.UploadedPart, error)
++	Upload(context.Context, oss.InitiateMultipartUploadResult, *driver115.UploadOSSParams, io.Reader, int64, int) (oss.UploadPart, error)
++	Complete(context.Context, oss.InitiateMultipartUploadResult, *driver115.UploadOSSParams, []oss.UploadPart) (*UploadResult, error)
++}
++
++func missingUpload(err error) bool {
++	var e oss.ServiceError
++	return errors.As(err, &e) && e.Code == "NoSuchUpload"
++}
++
++// Source SHA1 is recomputed before opening this record. Destination, account,
++// content and chunk geometry are all in its identity. Only server-acknowledged
++// parts are skipped; a process death before recording an ACK is reconciled
++// with ListParts and the corresponding local chunk's MD5.
++func runMultipart(ctx context.Context, store *resume.Store, key, sha1 string, size int64,
++	source io.ReaderAt, backend multipartBackend, init func() (*driver115.UploadOSSParams, *UploadResult, error),
++	up driver.UpdateProgress) (*UploadResult, error) {
++	release := store.Lease()
++	defer release()
++	unlock := store.Lock("upload-" + key)
++	defer unlock()
++	filename := "u-" + key + ".json"
++	chunks, err := SplitFile(size)
++	if err != nil {
++		return nil, err
++	}
++	rec := uploadCheckpoint{}
++	err = store.Read(filename, &rec)
++	fresh := os.IsNotExist(err)
++	if err != nil && !fresh {
++		return nil, err
++	}
++	if !fresh {
++		if rec.Version != 1 || rec.Key != key || rec.SHA1 != sha1 || rec.Size != size || rec.PartSize != chunks[0].Size ||
++			rec.Session.UploadID == "" || rec.Session.Key != rec.Params.Object || rec.Session.Bucket != rec.Params.Bucket ||
++			len(rec.Parts) > len(chunks) {
++			return nil, fmt.Errorf("upload checkpoint identity mismatch")
++		}
++		for i, p := range rec.Parts {
++			if p.PartNumber != i+1 || p.ETag == "" {
++				return nil, fmt.Errorf("invalid upload checkpoint parts")
++			}
++		}
++		var saved int64
++		for i := range rec.Parts {
++			saved += chunks[i].Size
++		}
++		resume.ProgressFrom(ctx).Saved(saved)
++		remote, e := backend.List(ctx, rec.Session)
++		if missingUpload(e) {
++			// Session is gone (including completion immediately before a crash).
++			// Re-run 115's SHA1 rapid-upload probe before sending any file bytes.
++			if e = store.Remove(filename); e != nil {
++				return nil, e
++			}
++			fresh = true
++		} else if e != nil {
++			return nil, e // Network/auth errors must never silently restart at zero.
++		} else {
++			if len(remote) > len(chunks) {
++				return nil, fmt.Errorf("unexpected remote multipart count")
++			}
++			parts := make([]oss.UploadPart, 0, len(remote))
++			for i, p := range remote {
++				ch := chunks[i]
++				if p.PartNumber != ch.Number || int64(p.Size) != ch.Size {
++					return nil, fmt.Errorf("remote multipart geometry changed")
++				}
++				h := md5.New()
++				if _, e = io.CopyN(h, io.NewSectionReader(source, ch.Offset, ch.Size), ch.Size); e != nil {
++					return nil, e
++				}
++				expected := hex.EncodeToString(h.Sum(nil))
++				if !strings.EqualFold(strings.Trim(p.ETag, `"`), expected) {
++					return nil, fmt.Errorf("remote multipart content changed")
++				}
++				if i < len(rec.Parts) && rec.Parts[i].ETag != p.ETag {
++					return nil, fmt.Errorf("remote multipart acknowledgement changed")
++				}
++				parts = append(parts, oss.UploadPart{PartNumber: p.PartNumber, ETag: p.ETag})
++			}
++			rec.Parts = parts
++		}
++	}
++	if fresh {
++		params, fast, e := init()
++		if e != nil || fast != nil {
++			return fast, e
++		}
++		session, e := backend.Initiate(ctx, params)
++		if e != nil {
++			return nil, e
++		}
++		rec = uploadCheckpoint{Version: 1, Key: key, Size: size, SHA1: sha1, Params: *params, Session: session, PartSize: chunks[0].Size}
++	}
++	rec.Params.SHA1 = sha1 // The SDK intentionally omits this field from JSON.
++	rec.SentBytes = 0
++	rec.ReusedBytes = 0
++	for i := 0; i < len(rec.Parts); i++ {
++		rec.ReusedBytes += chunks[i].Size
++	}
++	rec.Updated = time.Now().Unix()
++	if err = store.Write(filename, rec); err != nil {
++		return nil, err
++	}
++	progress := resume.ProgressFrom(ctx)
++	progress.Begin(rec.ReusedBytes)
++	up(float64(rec.ReusedBytes) * 100 / float64(size))
++	for i := len(rec.Parts); i < len(chunks); i++ {
++		ch := chunks[i]
++		if err = ctx.Err(); err != nil {
++			return nil, err
++		}
++		part, e := backend.Upload(ctx, rec.Session, &rec.Params, io.NewSectionReader(source, ch.Offset, ch.Size), ch.Size, ch.Number)
++		if e != nil {
++			return nil, e
++		} // Keep checkpoint. Retry reconciles ambiguous ACK.
++		rec.Parts = append(rec.Parts, part)
++		rec.SentBytes += ch.Size
++		rec.Updated = time.Now().Unix()
++		if err = store.Write(filename, rec); err != nil {
++			return nil, err
++		}
++		progress.Checkpoint(rec.ReusedBytes + rec.SentBytes)
++		up(float64(rec.ReusedBytes+rec.SentBytes) * 100 / float64(size))
++	}
++	progress.Checking("分片已传完，正在确认网盘文件")
++	result, err := backend.Complete(ctx, rec.Session, &rec.Params, rec.Parts)
++	if err != nil {
++		return nil, err
++	}
++	// Keep a small, credential-free verification record, not the callback/token.
++	summary := map[string]any{"version": 1, "key": key, "updated": time.Now().Unix(), "complete": true,
++		"size": size, "reused_bytes": rec.ReusedBytes, "sent_bytes": rec.SentBytes}
++	// Distinct key avoids ever interpreting a completed summary as a session.
++	if err = store.Write("u-"+resume.Key("finished", key)+".json", summaryWithKey(summary, resume.Key("finished", key))); err != nil {
++		return nil, err
++	}
++	if err = store.Remove(filename); err != nil {
++		return nil, err
++	}
++	return result, nil
++}
++
++func summaryWithKey(v map[string]any, key string) map[string]any { v["key"] = key; return v }
++
++type ossResumeBackend struct {
++	driver    *Pan115
++	token     *driver115.UploadOSSTokenResp
++	client    *oss.Client
++	refreshed time.Time
++}
++
++func (b *ossResumeBackend) bucket(name string) (*oss.Bucket, error) {
++	if b.client == nil || time.Since(b.refreshed) > 45*time.Minute {
++		token, err := b.driver.client.GetOSSToken()
++		if err != nil {
++			return nil, err
++		}
++		client, err := netutil.NewOSSClient(driver115.OSSEndpoint, token.AccessKeyID, token.AccessKeySecret, oss.EnableMD5(true), oss.EnableCRC(true))
++		if err != nil {
++			return nil, err
++		}
++		b.client, b.token, b.refreshed = client, token, time.Now()
++	}
++	return b.client.Bucket(name)
++}
++func (b *ossResumeBackend) options(ctx context.Context) []oss.Option {
++	return []oss.Option{oss.SetHeader(driver115.OssSecurityTokenHeaderName, b.token.SecurityToken), oss.UserAgentHeader(driver115.OSSUserAgent), oss.WithContext(ctx)}
++}
++func (b *ossResumeBackend) Initiate(ctx context.Context, p *driver115.UploadOSSParams) (oss.InitiateMultipartUploadResult, error) {
++	bucket, err := b.bucket(p.Bucket)
++	if err != nil {
++		return oss.InitiateMultipartUploadResult{}, err
++	}
++	return bucket.InitiateMultipartUpload(p.Object, append(b.options(ctx), oss.EnableSha1(), oss.Sequential())...)
++}
++func (b *ossResumeBackend) List(ctx context.Context, s oss.InitiateMultipartUploadResult) ([]oss.UploadedPart, error) {
++	bucket, err := b.bucket(s.Bucket)
++	if err != nil {
++		return nil, err
++	}
++	var parts []oss.UploadedPart
++	marker := 0
++	for {
++		page, err := bucket.ListUploadedParts(s, append(b.options(ctx), oss.PartNumberMarker(marker), oss.MaxParts(1000))...)
++		if err != nil {
++			return nil, err
++		}
++		parts = append(parts, page.UploadedParts...)
++		if !page.IsTruncated {
++			return parts, nil
++		}
++		next, err := strconv.Atoi(page.NextPartNumberMarker)
++		if err != nil || next <= marker {
++			return nil, fmt.Errorf("invalid multipart pagination")
++		}
++		marker = next
++	}
++}
++func (b *ossResumeBackend) Upload(ctx context.Context, s oss.InitiateMultipartUploadResult, p *driver115.UploadOSSParams, r io.Reader, size int64, number int) (oss.UploadPart, error) {
++	bucket, err := b.bucket(s.Bucket)
++	if err != nil {
++		return oss.UploadPart{}, err
++	}
++	return bucket.UploadPart(s, driver.NewLimitedUploadStream(ctx, r), size, number, append(driver115.OssOption(p, b.token), oss.WithContext(ctx))...)
++}
++func (b *ossResumeBackend) Complete(ctx context.Context, s oss.InitiateMultipartUploadResult, p *driver115.UploadOSSParams, parts []oss.UploadPart) (*UploadResult, error) {
++	bucket, err := b.bucket(s.Bucket)
++	if err != nil {
++		return nil, err
++	}
++	var body []byte
++	_, err = bucket.CompleteMultipartUpload(s, parts, append(driver115.OssOption(p, b.token), oss.WithContext(ctx), oss.CallbackResult(&body))...)
++	if err != nil {
++		return nil, err
++	}
++	var result UploadResult
++	if err = json.Unmarshal(body, &result); err != nil {
++		return nil, err
++	}
++	return &result, result.Err(string(body))
++}
++
++func (d *Pan115) resumableUpload(ctx context.Context, s model.FileStreamer, dirID, preHash, sha1 string, up driver.UpdateProgress) (model.Obj, error) {
++	store, err := getResumeStore()
++	if err != nil {
++		return nil, err
++	}
++	source, err := s.CacheFullAndWriter(&up, nil)
++	if err != nil {
++		return nil, err
++	}
++	key := resume.Key(d.transferIdentity(), dirID, s.GetName(), sha1, strconv.FormatInt(s.GetSize(), 10))
++	var rapidObject model.Obj
++	result, err := runMultipart(ctx, store, key, sha1, s.GetSize(), source, &ossResumeBackend{driver: d}, func() (*driver115.UploadOSSParams, *UploadResult, error) {
++		info, e := d.rapidUpload(s.GetSize(), s.GetName(), dirID, preHash, sha1, s)
++		if e != nil {
++			return nil, nil, e
++		}
++		matched, e := info.Ok()
++		if e != nil {
++			return nil, nil, e
++		}
++		if matched {
++			rapidObject, e = d.getNewFileByPickCode(info.PickCode)
++			return nil, &UploadResult{}, e
++		}
++		return &info.UploadOSSParams, nil, nil
++	}, up)
++	if err != nil {
++		return nil, err
++	}
++	if rapidObject != nil {
++		return rapidObject, nil
++	}
++	return d.getNewFile(result.Data.FileID)
++}
+--- a/OpenList-4.2.6/drivers/115/twodrive_resume_test.go
++++ b/OpenList-4.2.6/drivers/115/twodrive_resume_test.go
+@@ -0,0 +1,141 @@
++package _115
++
++import (
++	"bytes"
++	"context"
++	"crypto/md5"
++	"crypto/sha1"
++	"encoding/hex"
++	"errors"
++	"io"
++	"testing"
++
++	resume "github.com/OpenListTeam/OpenList/v4/internal/twodrive_resume"
++	driver115 "github.com/SheltonZhu/115driver/pkg/driver"
++	"github.com/aliyun/aliyun-oss-go-sdk/oss"
++)
++
++type fakeMultipart struct {
++	parts     []oss.UploadedPart
++	sent      int64
++	failPart  int
++	loseACK   bool
++	initCount int
++	listError error
++}
++
++func TestTwoDriveProductionUserAgent(t *testing.T) {
++	for _, ua := range []string{"TwoDrive/test", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) TwoDrive/1234"} {
++		if !twoDriveUserAgent(ua) {
++			t.Fatal("managed client not recognized", ua)
++		}
++	}
++	if twoDriveUserAgent("rclone/v1.75.1") {
++		t.Fatal("unmanaged client recognized")
++	}
++}
++
++func (b *fakeMultipart) Initiate(_ context.Context, p *driver115.UploadOSSParams) (oss.InitiateMultipartUploadResult, error) {
++	b.initCount++
++	b.parts = nil
++	return oss.InitiateMultipartUploadResult{UploadID: "session", Bucket: p.Bucket, Key: p.Object}, nil
++}
++func (b *fakeMultipart) List(context.Context, oss.InitiateMultipartUploadResult) ([]oss.UploadedPart, error) {
++	return b.parts, b.listError
++}
++func (b *fakeMultipart) Upload(_ context.Context, _ oss.InitiateMultipartUploadResult, _ *driver115.UploadOSSParams, r io.Reader, n int64, num int) (oss.UploadPart, error) {
++	if num == b.failPart && !b.loseACK {
++		return oss.UploadPart{}, errors.New("interrupted")
++	}
++	data, err := io.ReadAll(r)
++	if err != nil {
++		return oss.UploadPart{}, err
++	}
++	b.sent += int64(len(data))
++	sum := md5.Sum(data)
++	part := oss.UploadPart{PartNumber: num, ETag: hex.EncodeToString(sum[:])}
++	b.parts = append(b.parts, oss.UploadedPart{PartNumber: num, ETag: part.ETag, Size: int(n)})
++	if num == b.failPart {
++		return oss.UploadPart{}, errors.New("lost acknowledgement")
++	}
++	return part, nil
++}
++func (b *fakeMultipart) Complete(_ context.Context, _ oss.InitiateMultipartUploadResult, _ *driver115.UploadOSSParams, parts []oss.UploadPart) (*UploadResult, error) {
++	if len(parts) != len(b.parts) {
++		return nil, errors.New("wrong completion parts")
++	}
++	return &UploadResult{}, nil
++}
++
++func TestTwoDriveUploadRestartsReuseAcknowledgedAndAmbiguousParts(t *testing.T) {
++	for _, ambiguous := range []bool{false, true} {
++		t.Run(map[bool]string{false: "before-part", true: "lost-ack"}[ambiguous], func(t *testing.T) {
++			dir := t.TempDir()
++			s, _ := resume.New(dir)
++			data := bytes.Repeat([]byte("abcdefghijklmnop"), 2<<20) // 32 MiB / four parts.
++			h := sha1.Sum(data)
++			hash := hex.EncodeToString(h[:])
++			key := resume.Key("account", "directory", "name", hash)
++			backend := &fakeMultipart{failPart: 3, loseACK: ambiguous}
++			init := func() (*driver115.UploadOSSParams, *UploadResult, error) {
++				return &driver115.UploadOSSParams{Bucket: "bucket", Object: "object"}, nil, nil
++			}
++			_, err := runMultipart(context.Background(), s, key, hash, int64(len(data)), bytes.NewReader(data), backend, init, func(float64) {})
++			if err == nil {
++				t.Fatal("expected interruption")
++			}
++			already := backend.sent
++			s.Close()
++			s, err = resume.New(dir)
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer s.Close()
++			backend.failPart = 0
++			backend.sent = 0
++			_, err = runMultipart(context.Background(), s, key, hash, int64(len(data)), bytes.NewReader(data), backend, init, func(float64) {})
++			if err != nil {
++				t.Fatal(err)
++			}
++			if backend.sent != int64(len(data))-already || backend.initCount != 1 {
++				t.Fatal("reuploaded parts", backend.sent, already, backend.initCount)
++			}
++		})
++	}
++}
++
++func TestTwoDriveUploadRefusesChangedPartsAndTransientFailure(t *testing.T) {
++	for _, mode := range []string{"changed", "offline", "expired"} {
++		t.Run(mode, func(t *testing.T) {
++			s, _ := resume.New(t.TempDir())
++			defer s.Close()
++			data := make([]byte, 16<<20)
++			h := sha1.Sum(data)
++			hash := hex.EncodeToString(h[:])
++			key := resume.Key(hash)
++			b := &fakeMultipart{failPart: 2}
++			init := func() (*driver115.UploadOSSParams, *UploadResult, error) {
++				return &driver115.UploadOSSParams{Bucket: "bucket", Object: "object"}, nil, nil
++			}
++			runMultipart(context.Background(), s, key, hash, int64(len(data)), bytes.NewReader(data), b, init, func(float64) {})
++			b.failPart = 0
++			b.sent = 0
++			switch mode {
++			case "changed":
++				b.parts[0].ETag = "wrong"
++			case "offline":
++				b.listError = errors.New("network unavailable")
++			case "expired":
++				b.listError = oss.ServiceError{Code: "NoSuchUpload"}
++			}
++			_, err := runMultipart(context.Background(), s, key, hash, int64(len(data)), bytes.NewReader(data), b, init, func(float64) {})
++			if mode == "expired" {
++				if err != nil || b.initCount != 2 || b.sent != int64(len(data)) {
++					t.Fatal("expiry fallback failed", err)
++				}
++			} else if err == nil || b.sent != 0 || b.initCount != 1 {
++				t.Fatal("unsafe restart", err, b.sent)
++			}
++		})
++	}
++}
+--- a/OpenList-4.2.6/drivers/115/util.go
++++ b/OpenList-4.2.6/drivers/115/util.go
+@@ -16,13 +16,13 @@
+ 	"sync/atomic"
+ 	"time"
+ 
++	cipher "github.com/OpenListTeam/OpenList/v4/drivers/115/ec115"
+ 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+ 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
+ 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+ 	netutil "github.com/OpenListTeam/OpenList/v4/internal/net"
+ 	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
+ 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
+-	cipher "github.com/SheltonZhu/115driver/pkg/crypto/ec115"
+ 	driver115 "github.com/SheltonZhu/115driver/pkg/driver"
+ 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
+ 	"github.com/pkg/errors"
+@@ -414,26 +414,18 @@
+ }
+ 
+ func SplitFile(fileSize int64) (chunks []oss.FileChunk, err error) {
+-	for i := int64(1); i < 10; i++ {
+-		if fileSize < i*utils.GB { // 文件大小小于iGB时分为i*1000片
+-			if chunks, err = SplitFileByPartNum(fileSize, int(i*1000)); err != nil {
+-				return
+-			}
+-			break
+-		}
+-	}
+-	if fileSize > 9*utils.GB { // 文件大小大于9GB时分为10000片
+-		if chunks, err = SplitFileByPartNum(fileSize, 10000); err != nil {
+-			return
+-		}
+-	}
+-	// 单个分片大小不能小于100KB
+-	if chunks[0].Size < 100*utils.KB {
+-		if chunks, err = SplitFileByPartSize(fileSize, 100*utils.KB); err != nil {
+-			return
+-		}
+-	}
+-	return
++	if fileSize <= 0 {
++		return nil, errors.New("fileSize invalid")
++	}
++	// Keep 115's sequential SHA-1 upload. Larger parts avoid a round trip
++	// for each ~100KiB block, while the existing splitter enforces its limit.
++	const maxParts int64 = 9999
++	partSize := int64(8 * utils.MB)
++	minimum := (fileSize-1)/maxParts + 1
++	if minimum > partSize {
++		partSize = ((minimum-1)/int64(utils.MB) + 1) * int64(utils.MB)
++	}
++	return SplitFileByPartSize(fileSize, partSize)
+ }
+ 
+ // SplitFileByPartNum splits big file into parts by the num of parts.
+--- a/OpenList-4.2.6/drivers/115/ec115/cipher.go
++++ b/OpenList-4.2.6/drivers/115/ec115/cipher.go
+@@ -0,0 +1,221 @@
++package ec115
++
++import (
++	"crypto/aes"
++	"crypto/cipher"
++	"crypto/elliptic"
++	"crypto/rand"
++	"encoding/base64"
++	"encoding/binary"
++	"fmt"
++	"hash/crc32"
++	"io"
++	"math/big"
++
++	"github.com/aead/ecdh"
++	"github.com/andreburgaud/crypt2go/ecb"
++	"github.com/andreburgaud/crypt2go/padding"
++	"github.com/pierrec/lz4/v4"
++)
++
++var remotePubKey = []byte{
++	0x57, 0xA2, 0x92, 0x57, 0xCD, 0x23, 0x20, 0xE5,
++	0xD6, 0xD1, 0x43, 0x32, 0x2F, 0xA4, 0xBB, 0x8A,
++	0x3C, 0xF9, 0xD3, 0xCC, 0x62, 0x3E, 0xF5, 0xED,
++	0xAC, 0x62, 0xB7, 0x67, 0x8A, 0x89, 0xC9, 0x1A,
++	0x83, 0xBA, 0x80, 0x0D, 0x61, 0x29, 0xF5, 0x22,
++	0xD0, 0x34, 0xC8, 0x95, 0xDD, 0x24, 0x65, 0x24,
++	0x3A, 0xDD, 0xC2, 0x50, 0x95, 0x3B, 0xEE, 0xBA,
++}
++
++const (
++	p224BaseLen = 28
++	crcSalt     = "^j>WD3Kr?J2gLFjD4W2y@"
++)
++
++// 利用key进行异或操作
++func xor(src, key []byte) []byte {
++	secret := make([]byte, 0, len(src))
++	pad := len(src) % 4
++	if pad > 0 {
++		for i := 0; i < pad; i++ {
++			secret = append(secret, src[i]^key[i])
++		}
++		src = src[pad:]
++	}
++	keyLen := len(key)
++	num := 0
++	for _, s := range src {
++		if num >= keyLen {
++			num = num % keyLen
++		}
++		secret = append(secret, s^key[num])
++		num++
++	}
++
++	return secret
++}
++
++// EcdhCipher ECDH加密解密信息
++type EcdhCipher struct {
++	key    []byte
++	iv     []byte
++	pubKey []byte
++}
++
++// NewEcdhCipher 新建EcdhCipher
++func NewEcdhCipher() (*EcdhCipher, error) {
++	return newEcdhCipher(rand.Reader)
++}
++
++func newEcdhCipher(random io.Reader) (*EcdhCipher, error) {
++	x := big.NewInt(0).SetBytes(remotePubKey[:p224BaseLen])
++	y := big.NewInt(0).SetBytes(remotePubKey[p224BaseLen:])
++	remotePublic := ecdh.Point{X: x, Y: y}
++
++	p224 := ecdh.Generic(elliptic.P224())
++	private, public, err := p224.GenerateKey(random)
++	if err != nil {
++		return nil, err
++	}
++
++	buf := make([]byte, p224BaseLen)
++	switch p := public.(type) {
++	case ecdh.Point:
++		p.X.FillBytes(buf)
++		if big.NewInt(0).And(p.Y, big.NewInt(1)).Cmp(big.NewInt(1)) == 0 {
++			buf = append([]byte{p224BaseLen + 1, 0x03}, buf...)
++		} else {
++			buf = append([]byte{p224BaseLen + 1, 0x02}, buf...)
++		}
++	default:
++		return nil, fmt.Errorf("错误的public key类型")
++	}
++	if err != nil {
++		return nil, err
++	}
++
++	// ComputeSecret returns big.Int.Bytes(), which drops leading zero bytes.
++	// The 115 protocol derives AES key/IV from the fixed-width P-224 value.
++	// Preserve all 28 bytes; otherwise roughly 1/256 handshakes uses a shifted key.
++	secret := make([]byte, p224BaseLen)
++	new(big.Int).SetBytes(p224.ComputeSecret(private, remotePublic)).FillBytes(secret)
++
++	cipher := new(EcdhCipher)
++	cipher.key = secret[:aes.BlockSize]
++	cipher.iv = secret[len(secret)-aes.BlockSize:]
++	cipher.pubKey = buf
++	return cipher, nil
++}
++
++// Encrypt 加密
++func (c *EcdhCipher) Encrypt(plainText []byte) ([]byte, error) {
++	pad := padding.NewPkcs7Padding(aes.BlockSize)
++	data, err := pad.Pad(plainText)
++	if err != nil {
++		return nil, err
++	}
++
++	cipherText := make([]byte, 0, len(data))
++	var xorKey []byte
++	xorKey = append(xorKey, c.iv...)
++	block, err := aes.NewCipher(c.key)
++	if err != nil {
++		return nil, err
++	}
++	mode := ecb.NewECBEncrypter(block)
++	tmp := make([]byte, 0, aes.BlockSize)
++
++	for i, b := range data {
++		tmp = append(tmp, b^xorKey[i%aes.BlockSize])
++		if i%aes.BlockSize == aes.BlockSize-1 {
++			mode.CryptBlocks(xorKey, tmp)
++			cipherText = append(cipherText, xorKey...)
++			tmp = make([]byte, 0, aes.BlockSize)
++		}
++	}
++
++	return cipherText, nil
++}
++
++// Decrypt 解密
++func (c *EcdhCipher) Decrypt(cipherText []byte) (text []byte, e error) {
++	defer func() {
++		if err := recover(); err != nil {
++			e = fmt.Errorf("%v", err)
++		}
++	}()
++
++	// 115 may append a short trailer; retain its existing framing behavior,
++	// but reject missing/truncated blocks before indexing the length prefix.
++	cipherText = cipherText[0 : len(cipherText)-len(cipherText)%aes.BlockSize]
++	if len(cipherText) < aes.BlockSize {
++		return nil, fmt.Errorf("115 upload response has no encrypted block")
++	}
++
++	block, err := aes.NewCipher(c.key)
++	if err != nil {
++		return nil, err
++	}
++
++	lz4Block := make([]byte, len(cipherText))
++	mode := cipher.NewCBCDecrypter(block, c.iv)
++	mode.CryptBlocks(lz4Block, cipherText)
++
++	length := int(lz4Block[0]) + int(lz4Block[1])<<8
++	if length <= 0 || length > len(lz4Block)-2 {
++		return nil, fmt.Errorf("115 upload response has invalid compressed length")
++	}
++	text = make([]byte, 0x2000)
++	l, err := lz4.UncompressBlock(lz4Block[2:length+2], text)
++	if err != nil {
++		return nil, err
++	}
++
++	return text[:l], nil
++}
++
++// EncodeToken 加密token
++func (c *EcdhCipher) EncodeToken(timestamp int64) (string, error) {
++	random, err := rand.Int(rand.Reader, big.NewInt(256))
++	if err != nil {
++		return "", err
++	}
++	r1 := byte(random.Uint64())
++	random, err = rand.Int(rand.Reader, big.NewInt(256))
++	if err != nil {
++		return "", err
++	}
++	r2 := byte(random.Uint64())
++	tmp := make([]byte, 0, 48)
++
++	time := make([]byte, 4)
++	binary.BigEndian.PutUint32(time, uint32(timestamp))
++
++	for i := 0; i < 15; i++ {
++		tmp = append(tmp, c.pubKey[i]^r1)
++	}
++	tmp = append(tmp, []byte{r1, 0x73 ^ r1}...)
++	for i := 0; i < 3; i++ {
++		tmp = append(tmp, r1)
++	}
++	for i := 0; i < 4; i++ {
++		tmp = append(tmp, r1^time[3-i])
++	}
++	for i := 15; i < len(c.pubKey); i++ {
++		tmp = append(tmp, c.pubKey[i]^r2)
++	}
++	tmp = append(tmp, []byte{r2, 0x01 ^ r2}...)
++	for i := 0; i < 3; i++ {
++		tmp = append(tmp, r2)
++	}
++
++	crc := make([]byte, 4)
++	binary.BigEndian.PutUint32(crc, crc32.ChecksumIEEE(append([]byte(crcSalt), tmp...)))
++
++	for i := 0; i < 4; i++ {
++		tmp = append(tmp, crc[3-i])
++	}
++
++	return base64.StdEncoding.EncodeToString(tmp), nil
++}
+--- a/OpenList-4.2.6/drivers/115/ec115/cipher_test.go
++++ b/OpenList-4.2.6/drivers/115/ec115/cipher_test.go
+@@ -0,0 +1,73 @@
++package ec115
++
++import (
++	"bytes"
++	"crypto/aes"
++	"crypto/cipher"
++	"crypto/elliptic"
++	"encoding/binary"
++	"github.com/pierrec/lz4/v4"
++	"math/big"
++	"testing"
++)
++
++func TestTwoDriveFixedWidthSecret(t *testing.T) {
++	curve := elliptic.P224()
++	rx, ry := new(big.Int).SetBytes(remotePubKey[:28]), new(big.Int).SetBytes(remotePubKey[28:])
++	short, regular := 0, 0
++	for n := int64(1); n <= 1024; n++ {
++		scalar := big.NewInt(n).FillBytes(make([]byte, 28))
++		shared, _ := curve.ScalarMult(rx, ry, scalar)
++		expected := shared.FillBytes(make([]byte, 28))
++		randomInput := append([]byte(nil), scalar...)
++		randomInput[1] ^= 0x42 // elliptic.GenerateKey's sampling transform
++		c, err := newEcdhCipher(bytes.NewReader(randomInput))
++		if err != nil {
++			t.Fatal(err)
++		}
++		if !bytes.Equal(c.key, expected[:16]) || !bytes.Equal(c.iv, expected[12:]) {
++			t.Fatalf("scalar %d derives shifted AES material (%d-byte integer)", n, len(shared.Bytes()))
++		}
++		if len(shared.Bytes()) < 28 {
++			short++
++		} else {
++			regular++
++		}
++	}
++	if short == 0 || regular == 0 {
++		t.Fatal("test did not cover both leading-zero and ordinary secrets")
++	}
++	t.Logf("validated %d short and %d ordinary secrets", short, regular)
++}
++
++func TestTwoDriveRandomFailureReturnsError(t *testing.T) {
++	if _, err := newEcdhCipher(bytes.NewReader(nil)); err == nil {
++		t.Fatal("accepted failed random source")
++	}
++}
++
++func TestTwoDriveResponseBoundsAndRoundTrip(t *testing.T) {
++	c, _ := shortSecretFixture(t)
++	for _, raw := range [][]byte{nil, {}, {1}, make([]byte, 15), make([]byte, 144)} {
++		if _, err := c.Decrypt(raw); err == nil {
++			t.Fatal("accepted invalid response")
++		}
++	}
++	plain := bytes.Repeat([]byte(`{"status":1,"statuscode":0}`), 20)
++	compressed := make([]byte, lz4.CompressBlockBound(len(plain)))
++	n, err := lz4.CompressBlock(plain, compressed, nil)
++	if err != nil || n == 0 {
++		t.Fatal("compression fixture failed")
++	}
++	framed := make([]byte, ((n+2+15)/16)*16)
++	binary.LittleEndian.PutUint16(framed, uint16(n))
++	copy(framed[2:], compressed[:n])
++	block, _ := aes.NewCipher(c.key)
++	encoded := make([]byte, len(framed))
++	cipher.NewCBCEncrypter(block, c.iv).CryptBlocks(encoded, framed)
++	// Match the server's trailing bytes, which are outside its AES framing.
++	decoded, err := c.Decrypt(append(encoded, 1, 2, 3, 4))
++	if err != nil || !bytes.Equal(decoded, plain) {
++		t.Fatal("valid framed response did not decode")
++	}
++}
+--- a/OpenList-4.2.6/drivers/115/ec115/live_probe_test.go
++++ b/OpenList-4.2.6/drivers/115/ec115/live_probe_test.go
+@@ -0,0 +1,129 @@
++package ec115
++
++// Optional real-service A/B: random, never-uploaded content, upload-init only.
++// No OSS transfer and no response to a content challenge: no file is committed.
++import (
++	"bytes"
++	"crypto/aes"
++	"crypto/elliptic"
++	"crypto/md5"
++	"crypto/rand"
++	"crypto/sha1"
++	"encoding/hex"
++	"encoding/json"
++	"io"
++	"math/big"
++	"net/http"
++	"net/url"
++	"os"
++	"strconv"
++	"strings"
++	"testing"
++	"time"
++)
++
++func shortSecretFixture(t *testing.T) (*EcdhCipher, []byte) {
++	t.Helper()
++	curve := elliptic.P224()
++	rx := new(big.Int).SetBytes(remotePubKey[:28])
++	ry := new(big.Int).SetBytes(remotePubKey[28:])
++	for n := int64(1); n < 10000; n++ {
++		scalar := big.NewInt(n).Bytes()
++		shared, _ := curve.ScalarMult(rx, ry, scalar)
++		if len(shared.Bytes()) != 27 {
++			continue
++		}
++		x, y := curve.ScalarBaseMult(scalar)
++		public := make([]byte, 30)
++		public[0], public[1] = 29, 2+byte(y.Bit(0))
++		x.FillBytes(public[2:])
++		secret := shared.FillBytes(make([]byte, 28))
++		return &EcdhCipher{key: secret[:16], iv: secret[12:], pubKey: public}, shared.Bytes()
++	}
++	t.Fatal("short secret fixture not found")
++	return nil, nil
++}
++
++func TestTwoDriveLiveHandshakeAB(t *testing.T) {
++	filename := os.Getenv("TWODRIVE_HANDSHAKE_PROBE")
++	if filename == "" {
++		t.Skip("explicit live probe only")
++	}
++	raw, err := os.ReadFile(filename)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var info map[string]string
++	if err := json.Unmarshal(raw, &info); err != nil {
++		t.Fatal(err)
++	}
++	fixed, short := shortSecretFixture(t)
++	legacy := &EcdhCipher{key: short[:aes.BlockSize], iv: short[len(short)-aes.BlockSize:], pubKey: fixed.pubKey}
++	data := make([]byte, 1024*1024)
++	if _, err := rand.Read(data); err != nil {
++		t.Fatal(err)
++	}
++	digest := sha1.Sum(data)
++	fileid := strings.ToUpper(hex.EncodeToString(digest[:]))
++	target := "U_1_" + info["root"]
++	hash := sha1.Sum([]byte(info["userid"] + fileid + target + "0"))
++	sig := sha1.Sum([]byte(info["userkey"] + hex.EncodeToString(hash[:]) + "000000"))
++	client := &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{Proxy: nil}}
++	for _, trial := range []struct {
++		name   string
++		cipher *EcdhCipher
++		good   bool
++	}{
++		{"legacy_short_secret", legacy, false}, {"fixed_padded_secret", fixed, true},
++	} {
++		stamp := time.Now().UnixMilli()
++		ts := strconv.FormatInt(stamp, 10)
++		uidmd5 := md5.Sum([]byte(info["userid"]))
++		token := md5.Sum([]byte("Qclm8MGWUv59TnrR0XPg" + fileid + strconv.Itoa(len(data)) + info["userid"] + ts + hex.EncodeToString(uidmd5[:]) + "35.6.0.3"))
++		form := url.Values{"appid": {"0"}, "appversion": {"35.6.0.3"}, "userid": {info["userid"]},
++			"filename": {".twodrive-handshake-no-transfer.bin"}, "filesize": {strconv.Itoa(len(data))},
++			"fileid": {fileid}, "target": {target}, "sig": {strings.ToUpper(hex.EncodeToString(sig[:]))},
++			"t": {ts}, "token": {hex.EncodeToString(token[:])}}
++		body, err := trial.cipher.Encrypt([]byte(form.Encode()))
++		if err != nil {
++			t.Fatal(err)
++		}
++		k, err := trial.cipher.EncodeToken(stamp)
++		if err != nil {
++			t.Fatal(err)
++		}
++		request, err := http.NewRequest("POST", "https://uplb.115.com/4.0/initupload.php?"+url.Values{"k_ec": {k}}.Encode(), bytes.NewReader(body))
++		if err != nil {
++			t.Fatal(err)
++		}
++		request.Header.Set("Cookie", info["cookie"])
++		request.Header.Set("User-Agent", "Mozilla/5.0 115Browser/35.6.0.3")
++		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
++		response, err := client.Do(request)
++		if err != nil {
++			t.Fatal("request failed (details withheld)")
++		}
++		payload, err := io.ReadAll(io.LimitReader(response.Body, 65536))
++		response.Body.Close()
++		if err != nil {
++			t.Fatal("response read failed")
++		}
++		plain, decodeErr := trial.cipher.Decrypt(payload)
++		var result struct {
++			Status     int `json:"status"`
++			StatusCode int `json:"statuscode"`
++		}
++		valid := decodeErr == nil && json.Unmarshal(plain, &result) == nil
++		t.Logf("%s: HTTP %d, response_bytes=%d, decoded=%v, status=%d, statuscode=%d", trial.name, response.StatusCode, len(payload), valid, result.Status, result.StatusCode)
++		if decodeErr != nil {
++			t.Logf("decode_error=%v", decodeErr)
++		}
++		if trial.good && (!valid || (result.Status != 1 && result.Status != 7)) {
++			t.Fatal("fixed handshake did not reach non-committing upload stage")
++		}
++		if !trial.good && valid {
++			t.Fatal("legacy unexpectedly decoded; hypothesis not reproduced")
++		}
++		time.Sleep(time.Second)
++	}
++}
+--- a/OpenList-4.2.6/internal/bootstrap/config.go
++++ b/OpenList-4.2.6/internal/bootstrap/config.go
+@@ -194,6 +194,12 @@
+ }
+ 
+ func CleanTempDir() {
++	// The TwoDrive supervisor validates its private scratch directory and
++	// removes only owned upload files before launch. Do not broadly erase
++	// unrecognized files here (or destroy its recovery evidence).
++	if os.Getenv("TWODRIVE_TRANSACTIONS") != "" {
++		return
++	}
+ 	files, err := os.ReadDir(conf.Conf.TempDir)
+ 	if err != nil {
+ 		log.Errorln("failed list temp file: ", err)
+--- a/OpenList-4.2.6/internal/op/fs.go
++++ b/OpenList-4.2.6/internal/op/fs.go
+@@ -28,6 +28,9 @@
+ }
+ 
+ func list(ctx context.Context, storage driver.Driver, path string, args model.ListArgs, resultValidator func([]model.Obj) error) ([]model.Obj, error) {
++	if err := twoDriveRecover(ctx, storage); err != nil {
++		return nil, err
++	}
+ 	if storage.Config().CheckStatus && storage.GetStorage().Status != WORK {
+ 		return nil, errors.WithMessagef(errs.StorageNotInit, "storage status: %s", storage.GetStorage().Status)
+ 	}
+@@ -614,6 +617,9 @@
+ 	if storage.Config().CheckStatus && storage.GetStorage().Status != WORK {
+ 		return errors.WithMessagef(errs.StorageNotInit, "storage status: %s", storage.GetStorage().Status)
+ 	}
++	if twoDriveEnabled(storage) && twoDriveScope(utils.FixAndCleanPath(dstDirPath)) {
++		return twoDrivePut(ctx, storage, utils.FixAndCleanPath(dstDirPath), file, up)
++	}
+ 	// UrlTree PUT
+ 	if storage.Config().OnlyIndices {
+ 		var link string
+@@ -624,6 +630,11 @@
+ 	dstDirPath = utils.FixAndCleanPath(dstDirPath)
+ 	dstPath := stdpath.Join(dstDirPath, file.GetName())
+ 	tempName := file.GetName() + ".openlist_to_delete"
++	if storage.Config().Name == "115 Cloud" {
++		// 115 rewrites names that change the extension. Keep the original
++		// extension so the old upload can be addressed and removed exactly.
++		tempName = "openlist_to_delete_" + file.GetName()
++	}
+ 	tempPath := stdpath.Join(dstDirPath, tempName)
+ 	fi, err := GetUnwrap(ctx, storage, dstPath)
+ 	if err == nil {
+--- a/OpenList-4.2.6/internal/op/twodrive_transaction.go
++++ b/OpenList-4.2.6/internal/op/twodrive_transaction.go
+@@ -0,0 +1,362 @@
++package op
++
++// TwoDrive's short-lived overwrite journal is deliberately separate from
++// recovery archives. Immutable intent is fsynced BEFORE changing the old file.
++// Recovery derives the outcome from fresh IDs, sizes and SHA1s, never age/name
++// alone. Unknown states stop the sync without deleting either version.
++import (
++	"context"
++	"crypto/rand"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"os"
++	"path"
++	"path/filepath"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/OpenListTeam/OpenList/v4/internal/conf"
++	"github.com/OpenListTeam/OpenList/v4/internal/driver"
++	"github.com/OpenListTeam/OpenList/v4/internal/errs"
++	"github.com/OpenListTeam/OpenList/v4/internal/model"
++	"github.com/OpenListTeam/OpenList/v4/internal/stream"
++	resume "github.com/OpenListTeam/OpenList/v4/internal/twodrive_resume"
++	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
++)
++
++var twoDriveMu sync.Mutex
++
++type twoDriveContextKey struct{}
++type twoDriveIntent struct {
++	Version   int    `json:"version"`
++	ID        string `json:"id"`
++	Identity  string `json:"identity"`
++	Parent    string `json:"parent"`
++	ParentID  string `json:"parent_id"`
++	Name      string `json:"name"`
++	Temporary string `json:"temporary"`
++	OldID     string `json:"old_id"`
++	OldSHA1   string `json:"old_sha1"`
++	OldSize   int64  `json:"old_size"`
++	NewSHA1   string `json:"new_sha1"`
++	NewSize   int64  `json:"new_size"`
++}
++
++func twoDriveEnabled(s driver.Driver) bool {
++	return os.Getenv("TWODRIVE_TRANSACTIONS") != "" && s.Config().Name == "115 Cloud" &&
++		s.GetStorage().MountPath == "/115" && s.GetStorage().Remark == "Managed by TwoDrive"
++}
++func twoDriveScope(p string) bool {
++	return path.Clean(p) == p && (p == "/115Drive" || strings.HasPrefix(p, "/115Drive/")) &&
++		!strings.Contains(p, "\\")
++}
++func twoDriveIdentity(s driver.Driver) (string, error) {
++	var addition struct {
++		Cookie string `json:"cookie"`
++		Root   string `json:"root_folder_id"`
++	}
++	if json.Unmarshal([]byte(s.GetStorage().Addition), &addition) != nil {
++		return "", fmt.Errorf("TwoDrive: invalid storage identity")
++	}
++	uid := ""
++	for _, entry := range strings.Split(addition.Cookie, ";") {
++		k, v, ok := strings.Cut(strings.TrimSpace(entry), "=")
++		if ok && k == "UID" {
++			uid = strings.Split(v, "_")[0]
++		}
++	}
++	if uid == "" || addition.Root != "0" {
++		return "", fmt.Errorf("TwoDrive: account identity unavailable")
++	}
++	digest := sha256.Sum256([]byte(fmt.Sprintf("%d|%s|%s", s.GetStorage().ID, addition.Root, uid)))
++	return hex.EncodeToString(digest[:]), nil
++}
++func twoDriveHex(s string, n int) bool {
++	b, err := hex.DecodeString(s)
++	return err == nil && len(b) == n
++}
++func twoDriveValid(j twoDriveIntent) bool {
++	return j.Version == 1 && twoDriveHex(j.ID, 16) && twoDriveHex(j.Identity, 32) &&
++		twoDriveScope(j.Parent) && j.ParentID != "" && j.OldID != "" &&
++		j.Name != "." && j.Name != ".." && j.Name != "" && path.Base(j.Name) == j.Name &&
++		!strings.ContainsAny(j.Name, "\\\x00") &&
++		j.Temporary == "twodrive_pending_"+j.ID+path.Ext(j.Name) &&
++		j.OldSize >= 0 && j.NewSize >= 0 && twoDriveHex(j.OldSHA1, 20) && twoDriveHex(j.NewSHA1, 20)
++}
++func twoDriveWrite(j twoDriveIntent) (string, error) {
++	dir := os.Getenv("TWODRIVE_TRANSACTIONS")
++	if err := os.MkdirAll(dir, 0700); err != nil {
++		return "", err
++	}
++	filename := filepath.Join(dir, j.ID+".json")
++	data, err := json.Marshal(j)
++	if err != nil {
++		return "", err
++	}
++	f, err := os.OpenFile(filename, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
++	if err != nil {
++		return "", err
++	}
++	_, err = f.Write(data)
++	if err == nil {
++		err = f.Sync()
++	}
++	closeErr := f.Close()
++	if err == nil {
++		err = closeErr
++	}
++	return filename, err
++}
++func twoDriveMatches(o model.Obj, id, hash string, size int64) bool {
++	return o != nil && !o.IsDir() && (id == "" || o.GetID() == id) &&
++		o.GetSize() == size && strings.EqualFold(o.GetHash().GetHash(utils.SHA1), hash)
++}
++func twoDriveObjects(ctx context.Context, s driver.Driver, parent model.Obj) (map[string]model.Obj, error) {
++	rows, err := s.List(ctx, parent, model.ListArgs{Refresh: true, SkipHook: true})
++	if err != nil {
++		return nil, err
++	}
++	result := make(map[string]model.Obj)
++	seen := make(map[string]bool)
++	for _, o := range rows {
++		k := strings.ToLower(o.GetName())
++		if seen[k] {
++			return nil, fmt.Errorf("TwoDrive: ambiguous cloud names; recovery stopped")
++		}
++		seen[k] = true
++		result[o.GetName()] = o
++	}
++	return result, nil
++}
++func twoDriveReconcile(ctx context.Context, s driver.Driver, j twoDriveIntent, filename string) error {
++	identity, err := twoDriveIdentity(s)
++	if err != nil {
++		return err
++	}
++	if !twoDriveValid(j) || identity != j.Identity || filepath.Base(filename) != j.ID+".json" {
++		return fmt.Errorf("TwoDrive: invalid or different-account transaction; recovery stopped")
++	}
++	// Resolve the current path freshly and require the original parent ID.
++	// Invalidate only the path's ancestor listings, retaining unrelated startup
++	// caches. Object IDs below prove the resolved folder has not been replaced.
++	for p := path.Dir(j.Parent); ; p = path.Dir(p) {
++		Cache.dirCache.Delete(Key(s, p))
++		if p == "/" {
++			break
++		}
++	}
++	parent, err := GetUnwrap(ctx, s, j.Parent)
++	if err != nil {
++		return err
++	}
++	if parent.GetID() != j.ParentID {
++		return fmt.Errorf("TwoDrive: transaction folder moved or replaced")
++	}
++	objects, err := twoDriveObjects(ctx, s, parent)
++	if err != nil {
++		return err
++	}
++	final, temp := objects[j.Name], objects[j.Temporary]
++	oldFinal := twoDriveMatches(final, j.OldID, j.OldSHA1, j.OldSize)
++	oldTemp := twoDriveMatches(temp, j.OldID, j.OldSHA1, j.OldSize)
++	newFinal := twoDriveMatches(final, "", j.NewSHA1, j.NewSize)
++	switch {
++	case temp == nil && (oldFinal || newFinal):
++		// No rename yet, rollback already finished, or commit already cleaned.
++	case oldTemp && final == nil:
++		renamer, ok := s.(driver.RenameResult)
++		if !ok {
++			return errs.NotImplement
++		}
++		if _, err = renamer.Rename(ctx, temp, j.Name); err != nil {
++			return err
++		}
++		objects, err = twoDriveObjects(ctx, s, parent)
++		if err != nil {
++			return err
++		}
++		if objects[j.Temporary] != nil || !twoDriveMatches(objects[j.Name], j.OldID, j.OldSHA1, j.OldSize) {
++			return fmt.Errorf("TwoDrive: rollback verification failed")
++		}
++	case oldTemp && newFinal:
++		remover, ok := s.(driver.Remove)
++		if !ok {
++			return errs.NotImplement
++		}
++		// Delete only the exact recorded old object, never an arbitrary name.
++		if err = remover.Remove(ctx, temp); err != nil {
++			return err
++		}
++		objects, err = twoDriveObjects(ctx, s, parent)
++		if err != nil {
++			return err
++		}
++		if objects[j.Temporary] != nil || !twoDriveMatches(objects[j.Name], final.GetID(), j.NewSHA1, j.NewSize) {
++			return fmt.Errorf("TwoDrive: commit verification failed")
++		}
++	default:
++		return fmt.Errorf("TwoDrive: interrupted upload conflicts with cloud changes; files retained")
++	}
++	Cache.deleteDirectoryTree(Key(s, j.Parent))
++	return os.Remove(filename)
++}
++func twoDriveRecoverLocked(ctx context.Context, s driver.Driver) error {
++	entries, err := os.ReadDir(os.Getenv("TWODRIVE_TRANSACTIONS"))
++	if os.IsNotExist(err) {
++		return nil
++	}
++	if err != nil {
++		return err
++	}
++	for _, e := range entries {
++		if !strings.HasSuffix(e.Name(), ".json") {
++			continue
++		}
++		info, err := e.Info()
++		if err != nil {
++			return err
++		}
++		if !info.Mode().IsRegular() || info.Size() > 65536 {
++			return fmt.Errorf("TwoDrive: invalid transaction record")
++		}
++		filename := filepath.Join(os.Getenv("TWODRIVE_TRANSACTIONS"), e.Name())
++		data, err := os.ReadFile(filename)
++		if err != nil {
++			return err
++		}
++		var j twoDriveIntent
++		if json.Unmarshal(data, &j) != nil {
++			return fmt.Errorf("TwoDrive: unreadable transaction; recovery stopped")
++		}
++		if err = twoDriveReconcile(ctx, s, j, filename); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++func twoDriveRecover(ctx context.Context, s driver.Driver) error {
++	if !twoDriveEnabled(s) || ctx.Value(twoDriveContextKey{}) != nil {
++		return nil
++	}
++	twoDriveMu.Lock()
++	defer twoDriveMu.Unlock()
++	return twoDriveRecoverLocked(context.WithValue(ctx, twoDriveContextKey{}, true), s)
++}
++
++type twoDriveHashedStream struct {
++	model.FileStreamer
++	hash utils.HashInfo
++}
++
++func (s *twoDriveHashedStream) GetHash() utils.HashInfo { return s.hash }
++
++func twoDrivePut(ctx context.Context, s driver.Driver, dir string, file model.FileStreamer, up driver.UpdateProgress) (result error) {
++	// Start before receiving/hashing the new content, including overwrite
++	// transactions. A prior percentage is explicitly unverified until the
++	// driver has checked the source identity and server's part acknowledgements.
++	if file.GetSize() > 10*utils.MB && os.Getenv("TWODRIVE_RESUME") != "" {
++		if identity, err := twoDriveIdentity(s); err == nil {
++			if store, err := resume.EnvironmentStore(); err == nil {
++				ua, _ := ctx.Value(conf.UserAgentKey).(string)
++				p := resume.NewProgress(store, ua, resume.Key(identity, dir, file.GetName(), fmt.Sprint(file.GetSize())),
++					path.Join(dir, file.GetName()), "upload", file.GetSize())
++				if p != nil {
++					ctx = resume.WithProgress(ctx, p)
++					defer func() { p.Finish(result == nil) }()
++				}
++			}
++		}
++	}
++	twoDriveMu.Lock()
++	defer twoDriveMu.Unlock()
++	ctx = context.WithValue(ctx, twoDriveContextKey{}, true)
++	if err := twoDriveRecoverLocked(ctx, s); err != nil {
++		return err
++	}
++	if err := MakeDir(ctx, s, dir); err != nil && !errs.IsObjectAlreadyExists(err) {
++		return err
++	}
++	parent, err := GetUnwrap(ctx, s, dir)
++	if err != nil {
++		return err
++	}
++	if model.ObjHasMask(parent, model.NoWrite) {
++		return errs.PermissionDenied
++	}
++	objects, err := twoDriveObjects(ctx, s, parent)
++	if err != nil {
++		return err
++	}
++	old := objects[file.GetName()]
++	if old != nil && old.IsDir() {
++		return errs.NotFile
++	}
++	putter, ok := s.(driver.PutResult)
++	if !ok {
++		return errs.NotImplement
++	}
++	if up == nil {
++		up = func(float64) {}
++	}
++	defer Cache.deleteDirectoryTree(Key(s, dir))
++	if old == nil {
++		_, err = putter.Put(ctx, parent, file, up)
++		return err
++	}
++	// Finish receiving the upload before moving the old cloud file. Reuse this
++	// SHA1 in the driver's existing cache/upload handshake (no second hash pass).
++	_, hash, err := stream.CacheFullAndHash(file, &up, utils.SHA1)
++	if err != nil {
++		return err
++	}
++	if twoDriveMatches(old, "", hash, file.GetSize()) {
++		return nil
++	}
++	identity, err := twoDriveIdentity(s)
++	if err != nil {
++		return err
++	}
++	id := make([]byte, 16)
++	if _, err = rand.Read(id); err != nil {
++		return err
++	}
++	j := twoDriveIntent{Version: 1, ID: hex.EncodeToString(id), Identity: identity,
++		Parent: dir, ParentID: parent.GetID(), Name: file.GetName(), OldID: old.GetID(),
++		OldSHA1: old.GetHash().GetHash(utils.SHA1), OldSize: old.GetSize(), NewSHA1: hash, NewSize: file.GetSize()}
++	j.Temporary = "twodrive_pending_" + j.ID + path.Ext(j.Name)
++	if !twoDriveValid(j) || objects[j.Temporary] != nil {
++		return fmt.Errorf("TwoDrive: cannot safely journal overwrite")
++	}
++	filename, err := twoDriveWrite(j)
++	if err != nil {
++		return err
++	}
++	defer func() {
++		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
++		defer cancel()
++		if err := twoDriveReconcile(cleanup, s, j, filename); err != nil {
++			result = fmt.Errorf("TwoDrive: pending transaction retained for recovery: %w", err)
++		}
++	}()
++	renamer, ok := s.(driver.RenameResult)
++	if !ok {
++		return errs.NotImplement
++	}
++	if _, err = renamer.Rename(ctx, old, j.Temporary); err != nil {
++		return err
++	}
++	// Re-read after rename, before allowing an upload that could create duplicates.
++	objects, err = twoDriveObjects(ctx, s, parent)
++	if err != nil {
++		return err
++	}
++	if objects[j.Name] != nil || !twoDriveMatches(objects[j.Temporary], j.OldID, j.OldSHA1, j.OldSize) {
++		return fmt.Errorf("TwoDrive: rename verification failed")
++	}
++	wrapped := &twoDriveHashedStream{FileStreamer: file, hash: utils.NewHashInfo(utils.SHA1, hash)}
++	_, err = putter.Put(ctx, parent, wrapped, up)
++	return err
++}
+--- a/OpenList-4.2.6/internal/op/twodrive_transaction_test.go
++++ b/OpenList-4.2.6/internal/op/twodrive_transaction_test.go
+@@ -0,0 +1,190 @@
++package op
++
++import (
++	"bytes"
++	"context"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/OpenListTeam/OpenList/v4/internal/driver"
++	"github.com/OpenListTeam/OpenList/v4/internal/model"
++	"github.com/OpenListTeam/OpenList/v4/internal/stream"
++	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
++)
++
++type transactionDriver struct {
++	driver.Driver
++	model.Storage
++	rows map[string]*model.Object
++	fail string
++}
++
++func (d *transactionDriver) GetStorage() *model.Storage { return &d.Storage }
++func (d *transactionDriver) SetStorage(s model.Storage) { d.Storage = s }
++
++func (d *transactionDriver) Config() driver.Config {
++	return driver.Config{Name: "115 Cloud", NoOverwriteUpload: true}
++}
++func (d *transactionDriver) Get(ctx context.Context, p string) (model.Obj, error) {
++	return &model.Object{ID: "parent", Name: "115Drive", IsFolder: true}, nil
++}
++func (d *transactionDriver) List(context.Context, model.Obj, model.ListArgs) ([]model.Obj, error) {
++	if d.fail == "network" {
++		return nil, fmt.Errorf("offline")
++	}
++	var r []model.Obj
++	for _, o := range d.rows {
++		clone := *o
++		r = append(r, &clone)
++	}
++	return r, nil
++}
++func (d *transactionDriver) Rename(_ context.Context, o model.Obj, n string) (model.Obj, error) {
++	for k, v := range d.rows {
++		if v.ID == o.GetID() {
++			delete(d.rows, k)
++			v.Name = n
++			d.rows[n] = v
++			return v, nil
++		}
++	}
++	return nil, fmt.Errorf("missing")
++}
++func (d *transactionDriver) Remove(_ context.Context, o model.Obj) error {
++	if d.fail == "remove" {
++		return fmt.Errorf("offline")
++	}
++	for k, v := range d.rows {
++		if v.ID == o.GetID() {
++			delete(d.rows, k)
++			return nil
++		}
++	}
++	return fmt.Errorf("missing")
++}
++func (d *transactionDriver) Put(_ context.Context, _ model.Obj, f model.FileStreamer, _ driver.UpdateProgress) (model.Obj, error) {
++	if d.fail == "put" {
++		return nil, fmt.Errorf("upload failed")
++	}
++	o := &model.Object{ID: "new", Name: f.GetName(), Size: f.GetSize(), HashInfo: f.GetHash()}
++	d.rows[o.Name] = o
++	return o, nil
++}
++func transactionFixture(t *testing.T) (*transactionDriver, twoDriveIntent, string) {
++	t.Helper()
++	t.Setenv("TWODRIVE_TRANSACTIONS", t.TempDir())
++	d := &transactionDriver{Storage: model.Storage{ID: 123, MountPath: "/115", Remark: "Managed by TwoDrive",
++		Addition: `{"cookie":"UID=123_device_session; CID=unused","root_folder_id":"0"}`}, rows: map[string]*model.Object{}}
++	identity, _ := twoDriveIdentity(d)
++	j := twoDriveIntent{Version: 1, ID: strings.Repeat("a", 32), Identity: identity, Parent: "/115Drive",
++		ParentID: "parent", Name: "原文件.txt", OldID: "old", OldSHA1: utils.HashData(utils.SHA1, []byte("old")),
++		OldSize: 3, NewSHA1: utils.HashData(utils.SHA1, []byte("new")), NewSize: 3}
++	j.Temporary = "twodrive_pending_" + j.ID + ".txt"
++	file, err := twoDriveWrite(j)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return d, j, file
++}
++func oldObject(j twoDriveIntent, name string) *model.Object {
++	return &model.Object{ID: j.OldID, Name: name, Size: j.OldSize, HashInfo: utils.NewHashInfo(utils.SHA1, j.OldSHA1)}
++}
++func newObject(j twoDriveIntent) *model.Object {
++	return &model.Object{ID: "new", Name: j.Name, Size: j.NewSize, HashInfo: utils.NewHashInfo(utils.SHA1, j.NewSHA1)}
++}
++func TestTwoDriveCrashWindows(t *testing.T) {
++	for _, stage := range []string{"before-rename", "after-rename", "after-upload", "after-cleanup"} {
++		t.Run(stage, func(t *testing.T) {
++			d, j, f := transactionFixture(t)
++			switch stage {
++			case "before-rename":
++				d.rows[j.Name] = oldObject(j, j.Name)
++			case "after-rename":
++				d.rows[j.Temporary] = oldObject(j, j.Temporary)
++			case "after-upload":
++				d.rows[j.Temporary] = oldObject(j, j.Temporary)
++				d.rows[j.Name] = newObject(j)
++			case "after-cleanup":
++				d.rows[j.Name] = newObject(j)
++			}
++			// The recovery entrypoint reads the intent from disk, as after restart.
++			if err := twoDriveRecover(context.Background(), d); err != nil {
++				t.Fatal(err)
++			}
++			if len(d.rows) != 1 || d.rows[j.Name] == nil {
++				t.Fatal("incorrect cloud state")
++			}
++			if _, err := os.Stat(f); !os.IsNotExist(err) {
++				t.Fatal("journal retained")
++			}
++			if err := twoDriveRecover(context.Background(), d); err != nil {
++				t.Fatal("not idempotent", err)
++			}
++		})
++	}
++}
++func TestTwoDriveRecoveryRetainsAmbiguousFiles(t *testing.T) {
++	for _, kind := range []string{"changed-final", "changed-temp", "wrong-account", "wrong-parent", "offline", "delete-failure", "corrupt"} {
++		t.Run(kind, func(t *testing.T) {
++			d, j, f := transactionFixture(t)
++			d.rows[j.Temporary] = oldObject(j, j.Temporary)
++			d.rows[j.Name] = newObject(j)
++			switch kind {
++			case "changed-final":
++				d.rows[j.Name].HashInfo = utils.NewHashInfo(utils.SHA1, strings.Repeat("b", 40))
++			case "changed-temp":
++				d.rows[j.Temporary].ID = "someone-else"
++			case "wrong-account":
++				d.Storage.ID++
++			case "wrong-parent":
++				j.ParentID = "changed"
++				data, _ := os.ReadFile(f)
++				os.WriteFile(f, bytes.ReplaceAll(data, []byte(`"parent"`), []byte(`"changed"`)), 0600)
++			case "offline":
++				d.fail = "network"
++			case "delete-failure":
++				d.fail = "remove"
++			case "corrupt":
++				os.WriteFile(f, []byte("{"), 0600)
++			}
++			if err := twoDriveRecover(context.Background(), d); err == nil {
++				t.Fatal("unsafe recovery accepted")
++			}
++			if len(d.rows) != 2 {
++				t.Fatal("changed unknown files")
++			}
++			if _, err := os.Stat(f); err != nil {
++				t.Fatal("lost evidence")
++			}
++		})
++	}
++}
++func TestTwoDriveOverwriteAndRollback(t *testing.T) {
++	for _, fail := range []string{"", "put"} {
++		t.Run("upload-"+fail, func(t *testing.T) {
++			d, j, f := transactionFixture(t)
++			os.Remove(f)
++			d.rows[j.Name] = oldObject(j, j.Name)
++			d.fail = fail
++			input := &stream.FileStream{Obj: &model.Object{Name: j.Name, Size: 3}, Reader: bytes.NewReader([]byte("new"))}
++			err := twoDrivePut(context.Background(), d, "/115Drive", input, nil)
++			if (err != nil) != (fail != "") {
++				t.Fatal(err)
++			}
++			want := "new"
++			if fail != "" {
++				want = "old"
++			}
++			if len(d.rows) != 1 || d.rows[j.Name].ID != want {
++				t.Fatal("lost version")
++			}
++			files, _ := filepath.Glob(filepath.Join(os.Getenv("TWODRIVE_TRANSACTIONS"), "*.json"))
++			if len(files) != 0 {
++				t.Fatal("temporary intent remained")
++			}
++		})
++	}
++}
+--- a/OpenList-4.2.6/internal/twodrive_resume/download.go
++++ b/OpenList-4.2.6/internal/twodrive_resume/download.go
+@@ -0,0 +1,239 @@
++package twodrive_resume
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"fmt"
++	"io"
++	"os"
++	"sync"
++	"time"
++
++	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
++)
++
++type Fetch func(context.Context, int64, int64) (io.ReadCloser, error)
++
++type Download struct {
++	Store        *Store
++	Key          string
++	Size         int64
++	Fetch        Fetch
++	Progress     *Progress
++	prepareOnce  sync.Once
++	prepareError error
++}
++
++type downloadRecord struct {
++	Version      int            `json:"version"`
++	Key          string         `json:"key"`
++	Size         int64          `json:"size"`
++	Updated      int64          `json:"updated"`
++	Complete     bool           `json:"complete"`
++	Blocks       map[int]string `json:"blocks"`
++	NetworkBytes int64          `json:"network_bytes"`
++	ReusedBytes  int64          `json:"reused_bytes"`
++}
++
++func (d *Download) record() (downloadRecord, error) {
++	r := downloadRecord{Version: 1, Key: d.Key, Size: d.Size, Blocks: map[int]string{}}
++	err := d.Store.Read("d-"+d.Key+".json", &r)
++	if os.IsNotExist(err) {
++		err = nil
++	}
++	if err == nil && (r.Version != 1 || r.Key != d.Key || r.Size != d.Size || r.Blocks == nil) {
++		err = fmt.Errorf("download checkpoint identity mismatch")
++	}
++	return r, err
++}
++
++func (d *Download) blockBytes(blocks map[int]string) int64 {
++	var total int64
++	for index := range blocks {
++		if index >= 0 && int64(index)*BlockSize < d.Size {
++			total += min(BlockSize, d.Size-int64(index)*BlockSize)
++		}
++	}
++	return total
++}
++
++// Check saved chunks before reporting them as confirmed progress. This runs
++// once for the shared link, including when rclone requests parallel ranges.
++func (d *Download) prepare(ctx context.Context) error {
++	unlock := d.Store.Lock(d.Key)
++	defer unlock()
++	rec, err := d.record()
++	if err != nil {
++		return err
++	}
++	d.Progress.Saved(d.blockBytes(rec.Blocks))
++	for index, expected := range rec.Blocks {
++		if err = ctx.Err(); err != nil {
++			return err
++		}
++		valid := false
++		if index >= 0 && int64(index)*BlockSize < d.Size && len(expected) == 64 {
++			name := fmt.Sprintf("d-%s.%06d.bin", d.Key, index)
++			info, e := d.Store.root.Lstat(name)
++			if e == nil && info.Mode().IsRegular() && info.Size() == min(BlockSize, d.Size-int64(index)*BlockSize) {
++				b, e := d.Store.root.ReadFile(name)
++				sum := sha256.Sum256(b)
++				valid = e == nil && hex.EncodeToString(sum[:]) == expected
++			}
++		}
++		if !valid {
++			delete(rec.Blocks, index)
++		}
++	}
++	rec.Updated = time.Now().Unix()
++	rec.Complete = d.blockBytes(rec.Blocks) == d.Size
++	if err = d.Store.Write("d-"+d.Key+".json", rec); err != nil {
++		return err
++	}
++	d.Progress.Begin(d.blockBytes(rec.Blocks))
++	if rec.Complete {
++		d.Progress.Checking("缓存已校验，正在确认本地文件")
++	}
++	return nil
++}
++
++func (d *Download) chunk(ctx context.Context, index int) ([]byte, error) {
++	s := d.Store
++	chunkName := fmt.Sprintf("d-%s.%06d.bin", d.Key, index)
++	guard := sha256.Sum256([]byte(chunkName))
++	s.block[guard[0]].Lock()
++	defer s.block[guard[0]].Unlock()
++	size := min(BlockSize, d.Size-int64(index)*BlockSize)
++	unlock := s.Lock(d.Key)
++	rec, err := d.record()
++	hash := rec.Blocks[index]
++	unlock()
++	if err != nil {
++		return nil, err
++	}
++	reused := false
++	var b []byte
++	if len(hash) == 64 {
++		info, e := s.root.Lstat(chunkName)
++		if e == nil && info.Mode().IsRegular() && info.Size() == size {
++			b, e = s.root.ReadFile(chunkName)
++			sum := sha256.Sum256(b)
++			reused = e == nil && hex.EncodeToString(sum[:]) == hash
++		}
++	}
++	if !reused {
++		if err := ctx.Err(); err != nil {
++			return nil, err
++		}
++		rc, e := d.Fetch(ctx, int64(index)*BlockSize, size)
++		if e != nil {
++			return nil, e
++		}
++		b, err = readExact(rc, size)
++		rc.Close()
++		if err != nil {
++			return nil, err
++		} // Never mark truncated chunks complete.
++		sum := sha256.Sum256(b)
++		hash = hex.EncodeToString(sum[:])
++		if err = s.write(chunkName, b); err != nil {
++			return nil, err
++		}
++	}
++	unlock = s.Lock(d.Key)
++	defer unlock()
++	rec, err = d.record()
++	if err != nil {
++		return nil, err
++	}
++	rec.Blocks[index] = hash
++	rec.Updated = time.Now().Unix()
++	rec.Complete = int64(len(rec.Blocks)) == (d.Size+BlockSize-1)/BlockSize
++	if reused {
++		rec.ReusedBytes += size
++	} else {
++		rec.NetworkBytes += size
++	}
++	if err = s.Write("d-"+d.Key+".json", rec); err != nil {
++		return nil, err
++	}
++	d.Progress.Checkpoint(d.blockBytes(rec.Blocks))
++	if rec.Complete {
++		d.Progress.Checking("数据已传完，正在确认本地文件")
++	}
++	return b, nil
++}
++
++func (d *Download) RangeRead(ctx context.Context, r http_range.Range) (io.ReadCloser, error) {
++	if r.Start < 0 || r.Start > d.Size {
++		return nil, fmt.Errorf("invalid resume range")
++	}
++	length := r.Length
++	if length < 0 || length > d.Size-r.Start {
++		length = d.Size - r.Start
++	}
++	release := d.Store.Lease()
++	d.prepareOnce.Do(func() { d.prepareError = d.prepare(ctx) })
++	if d.prepareError != nil {
++		release()
++		return nil, d.prepareError
++	}
++	unlock := d.Store.Lock(d.Key)
++	rec, err := d.record()
++	if err == nil {
++		rec.Updated = time.Now().Unix()
++		err = d.Store.Write("d-"+d.Key+".json", rec)
++	}
++	unlock()
++	if err != nil {
++		release()
++		return nil, err
++	}
++	return &downloadReader{download: d, ctx: ctx, pos: r.Start, end: r.Start + length, index: -1, release: release}, nil
++}
++
++type downloadReader struct {
++	download *Download
++	ctx      context.Context
++	pos, end int64
++	index    int
++	block    []byte
++	release  func()
++}
++
++func (r *downloadReader) Read(p []byte) (int, error) {
++	if r.release == nil {
++		return 0, os.ErrClosed
++	}
++	if err := r.ctx.Err(); err != nil {
++		return 0, err
++	}
++	if len(p) == 0 {
++		return 0, nil
++	}
++	if r.pos >= r.end {
++		return 0, io.EOF
++	}
++	index := int(r.pos / BlockSize)
++	if index != r.index {
++		b, err := r.download.chunk(r.ctx, index)
++		if err != nil {
++			return 0, err
++		}
++		r.block, r.index = b, index
++	}
++	offset := r.pos % BlockSize
++	n := copy(p, r.block[offset:min(int64(len(r.block)), offset+r.end-r.pos)])
++	r.pos += int64(n)
++	return n, nil
++}
++
++func (r *downloadReader) Close() error {
++	if r.release != nil {
++		r.release()
++		r.release = nil
++		r.block = nil
++	}
++	return nil
++}
+--- a/OpenList-4.2.6/internal/twodrive_resume/download_test.go
++++ b/OpenList-4.2.6/internal/twodrive_resume/download_test.go
+@@ -0,0 +1,143 @@
++package twodrive_resume
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
++)
++
++func TestTwoDriveDownloadRestartAndCorruptChunk(t *testing.T) {
++	dir := t.TempDir()
++	data := make([]byte, 3*BlockSize+123)
++	for i := range data {
++		data[i] = byte(i % 251)
++	}
++	var network atomic.Int64
++	fetch := func(ctx context.Context, offset, size int64) (io.ReadCloser, error) {
++		network.Add(size)
++		return io.NopCloser(bytes.NewReader(data[offset : offset+size])), nil
++	}
++	s, err := New(dir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	key := Key("account", "file", "sha1", "size")
++	d := Download{Store: s, Key: key, Size: int64(len(data)), Fetch: fetch}
++	first, _ := d.RangeRead(context.Background(), http_range.Range{Length: 2 * BlockSize})
++	if _, err = io.Copy(io.Discard, first); err != nil {
++		t.Fatal(err)
++	}
++	first.Close()
++	s.Close()
++	if network.Load() != 2*BlockSize {
++		t.Fatal(network.Load())
++	}
++	// Restart, with one valid and one corrupt saved block.
++	if err = os.WriteFile(filepath.Join(dir, fmt.Sprintf("d-%s.%06d.bin", key, 1)), []byte("corrupt"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	s, err = New(dir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer s.Close()
++	d.Store = s
++	network.Store(0)
++	restarted, _ := d.RangeRead(context.Background(), http_range.Range{Length: -1})
++	got, err := io.ReadAll(restarted)
++	restarted.Close()
++	if err != nil || sha256.Sum256(got) != sha256.Sum256(data) {
++		t.Fatal("wrong restarted content", err)
++	}
++	if network.Load() != int64(len(data))-BlockSize {
++		t.Fatalf("did not reuse verified chunk: %d", network.Load())
++	}
++	var rec downloadRecord
++	if err = s.Read("d-"+key+".json", &rec); err != nil || !rec.Complete || rec.ReusedBytes != BlockSize {
++		t.Fatal(rec, err)
++	}
++}
++
++func TestTwoDriveParallelRangesAndShortRead(t *testing.T) {
++	s, _ := New(t.TempDir())
++	defer s.Close()
++	var network atomic.Int64
++	d := Download{Store: s, Key: Key("parallel"), Size: 2 * BlockSize, Fetch: func(ctx context.Context, start, n int64) (io.ReadCloser, error) {
++		network.Add(n)
++		return io.NopCloser(bytes.NewReader(make([]byte, n))), nil
++	}}
++	var wg sync.WaitGroup
++	for i := 0; i < 4; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			r, e := d.RangeRead(context.Background(), http_range.Range{Start: BlockSize / 2, Length: BlockSize})
++			if e != nil {
++				t.Error(e)
++				return
++			}
++			_, e = io.Copy(io.Discard, r)
++			r.Close()
++			if e != nil {
++				t.Error(e)
++			}
++		}()
++	}
++	wg.Wait()
++	if network.Load() != 2*BlockSize {
++		t.Fatal("duplicate network chunks", network.Load())
++	}
++	d.Key = Key("short")
++	d.Fetch = func(context.Context, int64, int64) (io.ReadCloser, error) {
++		return io.NopCloser(bytes.NewReader([]byte{1})), nil
++	}
++	r, _ := d.RangeRead(context.Background(), http_range.Range{Length: -1})
++	_, err := io.Copy(io.Discard, r)
++	r.Close()
++	if err == nil {
++		t.Fatal("accepted short network block")
++	}
++	var rec downloadRecord
++	s.Read("d-"+d.Key+".json", &rec)
++	if len(rec.Blocks) != 0 {
++		t.Fatal("short block checkpointed")
++	}
++}
++
++func TestTwoDriveCleanupLeasesAndUnknownFiles(t *testing.T) {
++	dir := t.TempDir()
++	s, _ := New(dir)
++	defer s.Close()
++	key := Key("old")
++	rec := downloadRecord{Version: 1, Key: key, Updated: time.Now().Add(-8 * 24 * time.Hour).Unix(), Size: BlockSize, Blocks: map[int]string{}}
++	s.Write("d-"+key+".json", rec)
++	os.WriteFile(filepath.Join(dir, "d-"+key+".000000.bin"), []byte("old"), 0600)
++	os.WriteFile(filepath.Join(dir, "keep.txt"), []byte("user"), 0600)
++	unknown := "d-" + Key("corrupt") + ".json"
++	os.WriteFile(filepath.Join(dir, unknown), []byte("{"), 0600)
++	release := s.Lease()
++	s.Clean(time.Now().Add(2 * time.Hour))
++	if _, err := os.Stat(filepath.Join(dir, "d-"+key+".json")); err != nil {
++		t.Fatal("active data removed")
++	}
++	release()
++	s.Clean(time.Now().Add(2 * time.Hour))
++	if _, err := os.Stat(filepath.Join(dir, "d-"+key+".json")); !os.IsNotExist(err) {
++		t.Fatal("expired data not removed")
++	}
++	for _, name := range []string{"keep.txt", unknown} {
++		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
++			t.Fatal(err)
++		}
++	}
++}
+--- a/OpenList-4.2.6/internal/twodrive_resume/progress.go
++++ b/OpenList-4.2.6/internal/twodrive_resume/progress.go
+@@ -0,0 +1,175 @@
++package twodrive_resume
++
++// Progress is a separate, credential-free view of transfer checkpoints. A UI
++// write must never prevent a transfer or change its recovery decisions.
++import (
++	"context"
++	"crypto/rand"
++	"encoding/hex"
++	"fmt"
++	"os"
++	"regexp"
++	"sync"
++	"time"
++)
++
++var environmentOnce sync.Once
++var environmentStore *Store
++var environmentError error
++
++func EnvironmentStore() (*Store, error) {
++	environmentOnce.Do(func() {
++		environmentStore, environmentError = New(os.Getenv("TWODRIVE_RESUME"))
++	})
++	return environmentStore, environmentError
++}
++
++var progressAgent = regexp.MustCompile(`(?:^| )TwoDrive/([a-f0-9]{16})(?: |$)`)
++
++type progressContext struct{}
++
++type ProgressSnapshot struct {
++	Version   int     `json:"version"`
++	Key       string  `json:"key"`
++	Run       string  `json:"run"`
++	ID        string  `json:"id"`
++	Name      string  `json:"name"`
++	Direction string  `json:"direction"`
++	Phase     string  `json:"phase"`
++	Size      int64   `json:"size"`
++	Bytes     int64   `json:"bytes"`
++	Saved     int64   `json:"saved_bytes"`
++	Resumed   bool    `json:"resumed"`
++	Confirmed bool    `json:"confirmed"`
++	Speed     float64 `json:"speed"`
++	Note      string  `json:"note"`
++	Updated   int64   `json:"updated"`
++	Complete  bool    `json:"complete"`
++}
++
++type Progress struct {
++	mu        sync.Mutex
++	store     *Store
++	state     ProgressSnapshot
++	lastBytes int64
++	lastTime  time.Time
++}
++
++func NewProgress(s *Store, ua, key, name, direction string, size int64) *Progress {
++	match := progressAgent.FindStringSubmatch(ua)
++	if s == nil || len(match) != 2 {
++		return nil
++	}
++	id := make([]byte, 16)
++	if _, err := rand.Read(id); err != nil {
++		return nil
++	}
++	p := &Progress{store: s, state: ProgressSnapshot{Version: 1, Key: key, Run: match[1], ID: hex.EncodeToString(id),
++		Name: name, Direction: direction, Size: size, Phase: "verifying", Note: "正在读取并校验文件和上次保存的分片"}}
++	var old ProgressSnapshot
++	if s.Read("h-"+key+".json", &old) == nil && old.Version == 1 && old.Key == key && old.Size == size && old.Direction == direction {
++		p.state.Saved = min(size, max(0, old.Bytes))
++	}
++	p.publish(false)
++	return p
++}
++
++func WithProgress(ctx context.Context, p *Progress) context.Context {
++	return context.WithValue(ctx, progressContext{}, p)
++}
++func ProgressFrom(ctx context.Context) *Progress {
++	p, _ := ctx.Value(progressContext{}).(*Progress)
++	return p
++}
++
++func (p *Progress) publish(checkpoint bool) {
++	p.state.Updated = time.Now().Unix()
++	_ = p.store.Write("p-"+p.state.Run+".json", p.state)
++	if checkpoint {
++		_ = p.store.Write("h-"+p.state.Key+".json", p.state)
++	}
++}
++
++// Saved is only a visual hint until this run has verified the recorded blocks.
++func (p *Progress) Saved(n int64) {
++	if p == nil {
++		return
++	}
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	p.state.Saved = min(p.state.Size, max(0, n))
++	p.publish(false)
++}
++
++func (p *Progress) Begin(verified int64) {
++	if p == nil {
++		return
++	}
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	p.state.Bytes = min(p.state.Size, max(0, verified))
++	p.state.Confirmed = true
++	p.state.Resumed = verified > 0
++	p.state.Phase = "transferring"
++	p.state.Note = ""
++	if verified > 0 {
++		p.state.Phase = "resuming"
++		p.state.Note = fmt.Sprintf("已核对并复用 %d 字节；百分比包含这些已完成分片", verified)
++	}
++	if verified == 0 && p.state.Saved > 0 {
++		p.state.Note = "文件内容或续传记录发生变化，已核对并重新开始"
++	}
++	p.state.Speed = 0
++	p.lastBytes = p.state.Bytes
++	p.lastTime = time.Now()
++	p.publish(true)
++}
++
++func (p *Progress) Checkpoint(done int64) {
++	if p == nil {
++		return
++	}
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	done = min(p.state.Size, max(0, done))
++	if done <= p.state.Bytes {
++		return
++	} // Parallel ranges must not count a block twice.
++	elapsed := time.Since(p.lastTime).Seconds()
++	if elapsed > 0 {
++		p.state.Speed = float64(done-p.lastBytes) / elapsed
++	}
++	p.state.Bytes = done
++	p.lastBytes = done
++	p.lastTime = time.Now()
++	p.publish(true)
++}
++
++func (p *Progress) Checking(note string) {
++	if p == nil {
++		return
++	}
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	p.state.Phase = "verifying"
++	p.state.Note = note
++	p.state.Speed = 0
++	p.publish(false)
++}
++
++func (p *Progress) Finish(success bool) {
++	if p == nil {
++		return
++	}
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	p.state.Phase = "error"
++	p.state.Speed = 0
++	if success {
++		p.state.Phase = "complete"
++		p.state.Complete = true
++		p.state.Bytes = p.state.Size
++		_ = p.store.Remove("h-" + p.state.Key + ".json")
++	}
++	p.publish(false)
++}
+--- a/OpenList-4.2.6/internal/twodrive_resume/progress_test.go
++++ b/OpenList-4.2.6/internal/twodrive_resume/progress_test.go
+@@ -0,0 +1,78 @@
++package twodrive_resume
++
++import (
++	"context"
++	"testing"
++)
++
++func TestTwoDriveProgressRestartKeepsSavedThenVerifiedBytes(t *testing.T) {
++	dir := t.TempDir()
++	s, err := New(dir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	key := Key("file")
++	ua := "Mozilla/5.0 TwoDrive/0123456789abcdef"
++	p := NewProgress(s, ua, key, "文件.bin", "upload", 64<<20)
++	p.Begin(0)
++	p.Checkpoint(16 << 20)
++	p.Finish(false)
++	s.Close()
++	s, err = New(dir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer s.Close()
++	p = NewProgress(s, ua, key, "文件.bin", "upload", 64<<20)
++	read := func() ProgressSnapshot {
++		var r ProgressSnapshot
++		if err := s.Read("p-0123456789abcdef.json", &r); err != nil {
++			t.Fatal(err)
++		}
++		return r
++	}
++	r := read()
++	if r.Phase != "verifying" || r.Saved != 16<<20 || r.Confirmed {
++		t.Fatal(r)
++	}
++	p.Begin(16 << 20)
++	r = read()
++	if r.Phase != "resuming" || r.Bytes != 16<<20 || !r.Confirmed {
++		t.Fatal(r)
++	}
++	p.Checkpoint(24 << 20)
++	p.Checkpoint(16 << 20)
++	r = read()
++	if r.Bytes != 24<<20 {
++		t.Fatal("parallel progress regressed", r)
++	}
++	p.Checkpoint(64 << 20)
++	p.Checking("确认文件")
++	r = read()
++	if r.Phase != "verifying" || r.Bytes != 64<<20 || r.Speed != 0 {
++		t.Fatal(r)
++	}
++	p.Finish(true)
++	var old ProgressSnapshot
++	if s.Read("h-"+key+".json", &old) == nil {
++		t.Fatal("completed hint retained")
++	}
++}
++
++func TestTwoDriveProgressChangedContentAndWriteFailure(t *testing.T) {
++	s, _ := New(t.TempDir())
++	p := NewProgress(s, "TwoDrive/0123456789abcdef", Key("file"), "file", "upload", 64<<20)
++	p.Saved(32 << 20)
++	p.Begin(0)
++	var r ProgressSnapshot
++	s.Read("p-0123456789abcdef.json", &r)
++	if r.Bytes != 0 || r.Resumed || r.Note == "" {
++		t.Fatal(r)
++	}
++	s.Close()
++	// Reporting is best effort; a locked/missing progress file never fails data.
++	p.Checkpoint(8 << 20)
++	p.Checking("test")
++	p.Finish(false)
++	ProgressFrom(context.Background()).Begin(0)
++}
+--- a/OpenList-4.2.6/internal/twodrive_resume/store.go
++++ b/OpenList-4.2.6/internal/twodrive_resume/store.go
+@@ -0,0 +1,215 @@
++// Package twodrive_resume holds transfer checkpoints, never file versions.
++package twodrive_resume
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"io"
++	"os"
++	"regexp"
++	"sync"
++	"time"
++)
++
++const BlockSize int64 = 8 << 20
++
++var validName = regexp.MustCompile(`^(?:[duh]-[a-f0-9]{64}(?:\.json|(?:\.[0-9]{6}\.bin))|p-[a-f0-9]{16}\.json)(?:\.tmp)?$`)
++
++// A lease prevents cleanup from racing any active transfer. os.Root confines
++// all reads and removals, including malicious/replaced symlinks, to this cache.
++type Store struct {
++	root      *os.Root
++	life      sync.RWMutex
++	meta      [256]sync.Mutex
++	block     [256]sync.Mutex
++	lastClean time.Time
++}
++
++func Key(parts ...string) string {
++	data, _ := json.Marshal(parts) // Length-delimited: names cannot alias fields.
++	sum := sha256.Sum256(data)
++	return hex.EncodeToString(sum[:])
++}
++
++func New(directory string) (*Store, error) {
++	if err := os.MkdirAll(directory, 0700); err != nil {
++		return nil, err
++	}
++	root, err := os.OpenRoot(directory)
++	if err != nil {
++		return nil, err
++	}
++	s := &Store{root: root}
++	owner := []byte("TwoDrive transfer checkpoints v1\n")
++	got, err := root.ReadFile("owner.txt")
++	if os.IsNotExist(err) {
++		var entries []os.DirEntry
++		f, e := root.Open(".")
++		if e == nil {
++			entries, e = f.ReadDir(-1)
++			f.Close()
++		}
++		if e != nil || len(entries) != 0 {
++			root.Close()
++			return nil, fmt.Errorf("resume cache is not empty/unowned")
++		}
++		err = s.write("owner.txt", owner)
++	} else if err == nil && string(got) != string(owner) {
++		err = fmt.Errorf("resume cache ownership mismatch")
++	}
++	if err != nil {
++		root.Close()
++		return nil, err
++	}
++	s.Clean(time.Now())
++	return s, nil
++}
++
++func (s *Store) Close() error { return s.root.Close() }
++
++func (s *Store) Lease() func() {
++	s.Clean(time.Now())
++	s.life.RLock()
++	return s.life.RUnlock
++}
++
++func (s *Store) Lock(key string) func() {
++	n := sha256.Sum256([]byte(key))
++	s.meta[n[0]].Lock()
++	return s.meta[n[0]].Unlock
++}
++
++func (s *Store) Read(name string, value any) error {
++	if !validName.MatchString(name) {
++		return fmt.Errorf("invalid checkpoint name")
++	}
++	info, err := s.root.Lstat(name)
++	if err != nil {
++		return err
++	}
++	if !info.Mode().IsRegular() || info.Size() > 8<<20 {
++		return fmt.Errorf("invalid checkpoint file")
++	}
++	b, err := s.root.ReadFile(name)
++	if err != nil {
++		return err
++	}
++	return json.Unmarshal(b, value)
++}
++
++func (s *Store) write(name string, b []byte) error {
++	tmp := name + ".tmp"
++	// Remove the directory entry first: do not follow an existing link.
++	if err := s.root.Remove(tmp); err != nil && !os.IsNotExist(err) {
++		return err
++	}
++	f, err := s.root.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
++	if err != nil {
++		return err
++	}
++	_, err = f.Write(b)
++	if err == nil {
++		err = f.Sync()
++	}
++	closeErr := f.Close()
++	if err == nil {
++		err = closeErr
++	}
++	if err == nil {
++		err = s.root.Rename(tmp, name)
++	}
++	return err
++}
++
++func (s *Store) Write(name string, value any) error {
++	if !validName.MatchString(name) {
++		return fmt.Errorf("invalid checkpoint name")
++	}
++	b, err := json.Marshal(value)
++	if err != nil {
++		return err
++	}
++	return s.write(name, b)
++}
++
++func (s *Store) Remove(name string) error {
++	if !validName.MatchString(name) {
++		return fmt.Errorf("invalid checkpoint name")
++	}
++	err := s.root.Remove(name)
++	if os.IsNotExist(err) {
++		return nil
++	}
++	return err
++}
++
++// Clean only recognized records and their exact block names. Unknown/corrupt
++// records are retained. Finished downloads live one day for interrupted local
++// delivery; unfinished transfers expire after seven days without use.
++func (s *Store) Clean(now time.Time) {
++	if !s.life.TryLock() {
++		return
++	}
++	defer s.life.Unlock()
++	if now.Sub(s.lastClean) < time.Hour {
++		return
++	}
++	s.lastClean = now
++	f, err := s.root.Open(".")
++	if err != nil {
++		return
++	}
++	entries, err := f.ReadDir(-1)
++	f.Close()
++	if err != nil {
++		return
++	}
++	for _, entry := range entries {
++		name := entry.Name()
++		if len(name) == 23 && validName.MatchString(name) {
++			var record ProgressSnapshot
++			if s.Read(name, &record) == nil && record.Version == 1 && record.Run == name[2:18] && record.Updated > 0 && now.Sub(time.Unix(record.Updated, 0)) > 24*time.Hour {
++				_ = s.root.Remove(name)
++				_ = s.root.Remove(name + ".tmp")
++			}
++			continue
++		}
++		if !validName.MatchString(name) || len(name) != 71 {
++			continue
++		} // [du]-hash.json
++		var header struct {
++			Version  int    `json:"version"`
++			Key      string `json:"key"`
++			Updated  int64  `json:"updated"`
++			Complete bool   `json:"complete"`
++		}
++		if s.Read(name, &header) != nil || header.Version != 1 || name[2:66] != header.Key || header.Updated <= 0 {
++			continue
++		}
++		ttl := 7 * 24 * time.Hour
++		if header.Complete {
++			ttl = 24 * time.Hour
++		}
++		if now.Sub(time.Unix(header.Updated, 0)) < ttl {
++			continue
++		}
++		prefix := name[:66]
++		for _, candidate := range entries {
++			n := candidate.Name()
++			if validName.MatchString(n) && len(n) >= 66 && n[:66] == prefix {
++				info, e := s.root.Lstat(n)
++				if e == nil && info.Mode().IsRegular() {
++					_ = s.root.Remove(n)
++				}
++			}
++		}
++	}
++}
++
++func readExact(r io.Reader, n int64) ([]byte, error) {
++	b := make([]byte, n)
++	_, err := io.ReadFull(r, b)
++	return b, err
++}
+--- a/OpenList-4.2.6/server/webdav/webdav.go
++++ b/OpenList-4.2.6/server/webdav/webdav.go
+@@ -357,7 +357,7 @@
+ 	defer release()
+ 	// TODO(rost): Support the If-Match, If-None-Match headers? See bradfitz'
+ 	// comments in http.checkEtag.
+-	ctx := r.Context()
++	ctx := context.WithValue(r.Context(), conf.UserAgentKey, r.UserAgent())
+ 	user := ctx.Value(conf.UserKey).(*model.User)
+ 	reqPath, err = user.JoinPath(reqPath)
+ 	if err != nil {

@@ -1,0 +1,8 @@
+# Keep identical for every bisync run. Review before changing after initialization.
+- desktop.ini
+- Thumbs.db
+- ~$*
+- *.crdownload
+- *.part
+- *.partial
+- .DS_Store
