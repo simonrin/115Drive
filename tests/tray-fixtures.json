@@ -4,7 +4,7 @@
  "idle":{"state":"idle","last_success":"2026-10-19T15:38:00+08:00"},
  "checking":{"state":"checking","message":"正在检查文件变化。"},
  "scan_progress":{"scan_stage":"cloud_check","current_path":"115Drive/工作资料/图片","scanned_dirs":7,"scanned_items":28},
- "error":{"state":"paused","retry_seconds":30,"message":"网盘暂时无法连接，30 秒后自动重试。"},
+ "error":{"state":"error","message":"同步设置需要检查，请查看日志。"},
  "progress":{"bytes":6291456,"total_bytes":16777216,"speed":2097152,"active":[{"name":"工作资料/设计稿.zip","direction":"upload","bytes":6291456,"size":16777216,"speed":2097152}],"last_success":"2026-10-19T15:35:00+08:00"},
  "activity":[{"name":"工作资料/项目说明.docx","action":"download","time":"2026-10-19T15:33:00+08:00"},{"name":"相册/周末照片.jpg","action":"upload","time":"2026-10-19T15:34:00+08:00"}]
 }

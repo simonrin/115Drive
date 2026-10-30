@@ -19,7 +19,9 @@ import threading
 import time
 import urllib.request
 import urllib.parse
+from local_watch import LocalChangeMonitor
 from sync_progress import SyncProgress, SyncPaused, execute as execute_sync
+from sync_errors import ActionRequiredError, TransientSyncError, recovery_policy
 
 ROOT = Path(os.environ.get('TWODRIVE_HOME', Path(__file__).resolve().parent)).resolve()
 PRIVATE = ROOT / 'runtime' / 'private'
@@ -48,8 +50,16 @@ def write_json(path, value):
 def status(state, message, **extra):
     try:
         previous=read_json(ROOT/'runtime/status.json')
-        if previous.get('last_success') and 'last_success' not in extra:
-            extra['last_success']=previous['last_success']
+        # A completed file may precede a later failure in the same bisync run.
+        # Preserve that observed transfer without claiming the run succeeded.
+        try:
+            observed=read_json(ROOT/'runtime/progress.json').get('last_transfer_at')
+            if observed and observed > previous.get('last_transfer_at',''):
+                previous['last_transfer_at']=observed
+        except (OSError,ValueError): pass
+        for field in ('last_success','last_check_at','last_sync_at','last_transfer_at'):
+            if previous.get(field) and field not in extra:
+                extra[field]=previous[field]
     except (OSError,ValueError): pass
     write_json(ROOT / 'runtime/status.json', dict(state=state, message=message,
         updated_at=dt.datetime.now().astimezone().isoformat(), **extra))
@@ -77,7 +87,9 @@ def api(path, body=None, token=None):
     with HTTP.open(req, timeout=120) as response:
         result = json.load(response)
     if result.get('code') != 200:
-        raise RuntimeError(f'OpenList {path}: code {result.get("code")}')
+        code=result.get('code')
+        error=ActionRequiredError if code in (401,403) else TransientSyncError
+        raise error(f'OpenList {path}: code {code}')
     return result.get('data')
 
 def login():
@@ -290,7 +302,10 @@ def native_115_request(cookie,path,query):
     req=urllib.request.Request(url,headers={'Cookie':cookie,'User-Agent':'Mozilla/5.0'})
     with HTTP.open(req,timeout=30) as response: result=json.load(response)
     if result.get('state') is not True:
-        raise RuntimeError('115 原始目录读取失败，已停止同步')
+        code=str(result.get('errno',result.get('errNo',result.get('code','unknown'))))
+        if code in ('99','990001') or result.get('is_login') is False:
+            raise ActionRequiredError('115 登录已失效，请暂停同步后重新扫码连接。')
+        raise TransientSyncError('115 原始目录读取失败，等待重试（代码 '+code+'）')
     return result
 
 def native_115_list(cookie,cid):
@@ -386,14 +401,14 @@ def sync_once(cfg, initial=False, *, interruptible=False, changed_paths=None):
     progress=SyncProgress(ROOT)
     if interruptible: progress.cancelled=lambda:(ROOT/'runtime/stop').exists() or folder_guard().exists()
     try:
-        _sync_once(cfg,initial,progress,changed_paths=changed_paths)
+        synchronized=_sync_once(cfg,initial,progress,changed_paths=changed_paths)
     except SyncPaused:
         progress.finish(None)
         raise
     except Exception:
         progress.finish(False)
         raise
-    progress.finish(True)
+    progress.finish(True, synchronized=synchronized is not False)
 
 def _sync_once(cfg, initial, progress, *, changed_paths=None):
     local = Path(cfg['local_path'])
@@ -427,8 +442,8 @@ def _sync_once(cfg, initial, progress, *, changed_paths=None):
     # eventually be rehashed. Hasher entries expire after 24 hours.
     hash_audit_due=time.time()-last_run>=86400
     if scanner and not changed and changed_paths is not None and not hash_audit_due and not interrupted:
-        status('idle','文件清单核对完成，等待变化。',last_success=dt.datetime.now().astimezone().isoformat())
-        return
+        status('idle','文件清单核对完成，等待变化。',last_check_at=dt.datetime.now().astimezone().isoformat())
+        return False
     # A disabled optional archive must not add requests or block normal sync.
     if cfg.get('recovery_enabled',False):
         token=login()
@@ -443,12 +458,18 @@ def _sync_once(cfg, initial, progress, *, changed_paths=None):
     progress.process_started=recovery_run.started
     result=execute_sync(args,progress,ROOT/'logs/bisync.log')
     if result.returncode:
-        raise RuntimeError(f'同步暂停，rclone 退出码 {result.returncode}；请查看 logs/bisync.log')
+        error=TransientSyncError if result.returncode in (1,5,6,10) else ActionRequiredError
+        raise error(f'同步暂停，rclone 退出码 {result.returncode}；请查看 logs/bisync.log')
     if scanner:
         scanner.synchronized()
     recovery_run.complete()
     write_json(PRIVATE/'last-sync-run.json',dict(at=time.time()))
-    status('idle','同步完成，等待文件变化。',last_success=dt.datetime.now().astimezone().isoformat())
+    finished=dt.datetime.now().astimezone().isoformat()
+    times=dict(last_success=finished,last_check_at=finished,last_sync_at=finished)
+    transferred=progress.data.get('last_transfer_at')
+    if isinstance(transferred,str) and transferred: times['last_transfer_at']=transferred
+    status('idle','同步完成，等待文件变化。',**times)
+    return True
 
 def initialize_sync():
     cfg=read_json(CONFIG)
@@ -531,24 +552,57 @@ def wait_for_folder_change():
         time.sleep(.5)
 
 
+def wait_for_retry(error, failures):
+    """Back off without confusing a recoverable failure with a user pause."""
+    delay=min(300,30*2**min(max(failures-1,0),4))
+    deadline=time.monotonic()+delay
+    retry_at=dt.datetime.now().astimezone()+dt.timedelta(seconds=delay)
+    status('retrying',str(error),error_category=recovery_policy(error).category,retry_seconds=delay,
+           retry_at=retry_at.isoformat(),retry_attempt=failures)
+    while True:
+        if ((ROOT/'runtime/stop').exists() or (ROOT/'runtime/sync-now').exists()
+                or folder_guard().exists()):
+            return
+        remaining=deadline-time.monotonic()
+        if remaining<=0:
+            return
+        time.sleep(min(1,remaining))
+
+
+def wait_for_action(error):
+    status('error',str(error),error_category=recovery_policy(error).category,requires_action=True)
+    while not ((ROOT/'runtime/stop').exists() or (ROOT/'runtime/sync-now').exists()
+               or folder_guard().exists()):
+        time.sleep(1)
+
+
 def worker_loop():
-        cfg=read_json(CONFIG)
-        marker=read_json(PRIVATE/'initialized.json')
-        if (marker['local'],marker['remote']) != (cfg['local_path'],cfg['remote_path']):
-            raise RuntimeError('Sync path changed; refusing to reuse old state')
-        if marker['filter_sha256'] != hashlib.sha256((ROOT/'filters.txt').read_bytes()).hexdigest():
-            raise RuntimeError('Filters changed; manual review needed')
-        previous=None
-        synced_snapshot=None
-        try:
-            saved=read_json(PRIVATE/'local-snapshot.json')
-            if saved['local']==cfg['local_path'] and saved['remote']==cfg['remote_path']:
-                synced_snapshot={k:tuple(v) for k,v in saved['entries'].items()}
-        except (OSError,ValueError,KeyError,TypeError): pass
-        next_sync=0
-        changed_at=0
-        failures=0
-        pause_reported=False
+    cfg=read_json(CONFIG)
+    marker=read_json(PRIVATE/'initialized.json')
+    if (marker['local'],marker['remote']) != (cfg['local_path'],cfg['remote_path']):
+        raise RuntimeError('Sync path changed; refusing to reuse old state')
+    if marker['filter_sha256'] != hashlib.sha256((ROOT/'filters.txt').read_bytes()).hexdigest():
+        raise RuntimeError('Filters changed; manual review needed')
+    previous=None
+    synced_snapshot=None
+    try:
+        saved=read_json(PRIVATE/'local-snapshot.json')
+        if saved['local']==cfg['local_path'] and saved['remote']==cfg['remote_path']:
+            synced_snapshot={k:tuple(v) for k,v in saved['entries'].items()}
+    except (OSError,ValueError,KeyError,TypeError): pass
+    next_sync=0
+    changed_at=0
+    failures=0
+    pause_reported=False
+    force_scan=True
+    def watch_metrics(data):
+        write_json(ROOT/'runtime/local-watch.json',dict(data,pid=os.getpid(),
+            updated_at=dt.datetime.now().astimezone().isoformat()))
+    monitor=LocalChangeMonitor(Path(cfg['local_path']),snapshot,
+        full_scan_seconds=cfg.get('local_full_scan_seconds',60),
+        poll_seconds=cfg['local_scan_seconds'],enabled=cfg.get('local_watch_enabled',True),
+        notify=watch_metrics)
+    with contextlib.closing(monitor):
         while True:
             if folder_guard().exists():
                 return  # Re-read config and snapshots after a completed/rolled-back move.
@@ -560,16 +614,21 @@ def worker_loop():
                 continue
             if pause_reported:
                 next_sync=0
+                failures=0
                 pause_reported=False
+                force_scan=True
             requested=ROOT/'runtime/sync-now'
             if requested.exists():
                 requested.unlink(missing_ok=True)
+                force_scan=True
                 next_sync=0
+                failures=0
             try:
                 local=Path(cfg['local_path'])
                 if not local.is_dir() or is_reparse(local) or not (local/SENTINEL).is_file():
-                    raise RuntimeError('本地目录或健康标记缺失，已停止同步以保护云端文件。')
-                current=snapshot(local)
+                    raise ActionRequiredError('本地目录或健康标记缺失，已停止同步以保护云端文件。')
+                current=monitor.poll(force=force_scan)
+                force_scan=False
                 now=time.monotonic()
                 if current!=previous:
                     changed_at=now
@@ -581,8 +640,9 @@ def worker_loop():
                         key for key in current.keys() | synced_snapshot.keys()
                         if current.get(key) != synced_snapshot.get(key)}
                     sync_once(cfg,interruptible=True,changed_paths=changes)
+                    if current != synced_snapshot:
+                        write_json(PRIVATE/'local-snapshot.json',dict(local=cfg['local_path'],remote=cfg['remote_path'],entries=current))
                     synced_snapshot=current
-                    write_json(PRIVATE/'local-snapshot.json',dict(local=cfg['local_path'],remote=cfg['remote_path'],entries=current))
                     failures=0
                     changed_at=0
                     next_sync=time.monotonic()+cfg['cloud_poll_seconds']
@@ -593,16 +653,17 @@ def worker_loop():
                         next_sync=0
                 time.sleep(cfg['local_scan_seconds'])
             except SyncPaused:
+                force_scan=True
                 status('paused','同步已暂停，可以安全检查文件。')
                 failures=0
             except Exception as error:
+                force_scan=True
                 failures+=1
-                wait=min(300,30*2**min(failures-1,4))
-                status('paused',str(error),retry_seconds=wait)
-                next_sync=time.monotonic()+wait
-                for _ in range(wait):
-                    if (ROOT/'runtime/stop').exists() or (ROOT/'runtime/sync-now').exists() or folder_guard().exists(): break
-                    time.sleep(1)
+                if recovery_policy(error).retryable:
+                    wait_for_retry(error,failures)
+                else:
+                    wait_for_action(error)
+                next_sync=0
 
 
 def worker():

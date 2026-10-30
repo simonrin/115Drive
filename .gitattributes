@@ -1,0 +1,7 @@
+* text=auto eol=lf
+*.zip binary
+*.png binary
+*.ico binary
+# Preserve upstream license formatting and unified-diff context.
+licenses/* -whitespace
+*.patch -whitespace

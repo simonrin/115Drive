@@ -57,6 +57,7 @@ namespace TwoDrive {
    panel.Hide();
    if(settings==null) {
     using(var stream=File.OpenRead(Path.Combine(root,"tray/Settings.xaml")))settings=(Window)XamlReader.Load(stream);
+    settings.Icon=BrandImage();SF<Image>("SettingsBrandIcon").Source=settings.Icon;SF<Image>("AboutBrandIcon").Source=settings.Icon;
     settings.Closed+=(s,e)=>{if(settingsTimer!=null)settingsTimer.Stop();settings=null;};
     SF<Button>("SyncNav").Click+=(s,e)=>SettingsPage("Sync");
     SF<Button>("AccountNav").Click+=(s,e)=>SettingsPage("Account");
@@ -119,8 +120,8 @@ namespace TwoDrive {
    SF<TextBlock>("LocalFolderLabel").ToolTip=Text(info,"local_path");
    SF<CheckBox>("StartupCheck").IsChecked=Value(info,"start_with_windows") as bool? ?? true;
    SF<TextBlock>("DataFolderLabel").Text="程序与数据位置：\n"+root;
-   SF<TextBlock>("SyncStateLabel").Text=Text(status,"state")=="idle"?"文件已同步":Text(status,"message");
-   SF<Button>("SettingsPauseButton").Content=Text(status,"state")=="paused"||Text(status,"state")=="error"?"恢复同步":"暂停同步";
+   SF<TextBlock>("SyncStateLabel").Text=Retrying(status)?RetryTitle(status):Text(status,"state")=="idle"?"文件已同步":Text(status,"message");
+   SF<Button>("SettingsPauseButton").Content=!Retrying(status)&&(Text(status,"state")=="paused"||(Text(status,"state")=="error"&&!Object.Equals(Value(status,"requires_action"),true)))?"恢复同步":"暂停同步";
    SF<Button>("SettingsPauseButton").IsEnabled=settingsInitialized&&!settingsBusy;
    SF<TextBlock>("AccountStateLabel").Text=settingsInitialized?"已连接 · 双向同步 /115Drive":"尚未连接，先确认同步位置，再扫码登录。";
    bool authAllowed=Value(status,"authorization_allowed") as bool? ?? !settingsInitialized;
@@ -197,6 +198,19 @@ namespace TwoDrive {
   void TestNativeSettings(List<string> passed) {
    Find<Button>("SettingsButton").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
    if(settings==null||!settings.IsVisible)throw new Exception("Native settings did not open");passed.Add("tray_gear_opens_native_settings");
+   var retryInfo=new Dictionary<string,object>{{"local_path",Text(Read("config.json"),"local_path")},{"initialized",true},{"start_with_windows",true}};
+   var retryState=new Dictionary<string,object>{{"state","retrying"},{"message","网络连接暂时不可用"},{"retry_at",DateTimeOffset.Now.AddSeconds(60).ToString("o")},{"retry_seconds",60}};
+   Render(retryState,new Dictionary<string,object>(),null);RenderSettings(retryInfo,retryState,new Dictionary<string,object>());
+   SF<Button>("SettingsPauseButton").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+   if(!SF<TextBlock>("SyncStateLabel").Text.Contains("01:00 后重试") || Convert.ToString(SF<Button>("SettingsPauseButton").Content)!="暂停同步" || lastCommand!="pause")throw new Exception("Settings retry countdown or pause mismatch");
+   passed.Add("native_settings_retry_countdown_and_pause");
+   var blockedState=new Dictionary<string,object>{{"state","error"},{"requires_action",true},{"message","请暂停后重新连接"}};
+   Render(blockedState,new Dictionary<string,object>(),null);RenderSettings(retryInfo,blockedState,new Dictionary<string,object>());
+   SF<Button>("SettingsPauseButton").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+   if(Convert.ToString(SF<Button>("SettingsPauseButton").Content)!="暂停同步" || lastCommand!="pause")throw new Exception("Blocked settings cannot pause before reconnecting");
+   passed.Add("native_settings_action_required_can_pause");
+   var idleState=new Dictionary<string,object>{{"state","idle"}};
+   Render(idleState,new Dictionary<string,object>(),null);RenderSettings(retryInfo,idleState,new Dictionary<string,object>());
    SF<Button>("ChangeFolderButton").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
    SF<Button>("BrowseFolderButton").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
    SF<Button>("CheckFolderButton").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));

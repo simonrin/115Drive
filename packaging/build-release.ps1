@@ -28,7 +28,7 @@ if ($LASTEXITCODE) { throw 'Package privacy/structure verification failed' }
 & $Python (Join-Path $PSScriptRoot 'zip-package.py') $stage (Join-Path $output '115Drive-0.2.0-windows-x64.zip')
 if ($LASTEXITCODE) { throw 'Package archive failed' }
 $framework=Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319'
-& (Join-Path $framework 'csc.exe') /nologo /utf8output /codepage:65001 /target:winexe /platform:x64 /optimize+ ('/out:'+(Join-Path $output '115Drive-Setup-0.2.0-x64.exe')) ('/win32icon:'+(Join-Path $root 'tray\115Drive.ico')) ('/resource:'+(Join-Path $output '115Drive-0.2.0-windows-x64.zip')+',payload.zip') /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll /reference:System.IO.Compression.dll (Join-Path $PSScriptRoot 'Installer.cs')
+& (Join-Path $framework 'csc.exe') /nologo /utf8output /codepage:65001 /target:winexe /platform:x64 /optimize+ ('/out:'+(Join-Path $output '115Drive-Setup-0.2.0-x64.exe')) ('/win32icon:'+(Join-Path $root 'tray\115Drive.ico')) ('/resource:'+(Join-Path $output '115Drive-0.2.0-windows-x64.zip')+',payload.zip') /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll /reference:System.IO.Compression.dll (Join-Path $PSScriptRoot 'Installer.cs') (Join-Path $root 'tray\CloudBrand.cs')
 if ($LASTEXITCODE) { throw 'Installer compilation failed' }
 Get-ChildItem -LiteralPath $output -File | Where-Object Name -ne 'SHA256SUMS.txt' | Get-FileHash -Algorithm SHA256 | ForEach-Object { $_.Hash.ToLower()+'  '+[System.IO.Path]::GetFileName($_.Path) } | Set-Content -LiteralPath (Join-Path $output 'SHA256SUMS.txt') -Encoding ASCII
 Get-ChildItem -LiteralPath $output -File | Select-Object Name,Length

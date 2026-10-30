@@ -41,7 +41,11 @@ class SyncProgress:
         self.path = self.root / 'runtime/progress.json'
         activities = load(self.root / 'runtime/activity.json', [])
         self.activities = [x for x in activities if x.get('action') != 'backup'][-60:] if isinstance(activities,list) else []
-        self.last_success = load(self.path, {}).get('last_success') or load(self.root/'runtime/status.json',{}).get('last_success')
+        saved_status=load(self.root/'runtime/status.json',{})
+        saved_progress=load(self.path,{})
+        self.timestamps={key:saved_status.get(key) or saved_progress.get(key) for key in
+                         ('last_check_at','last_sync_at','last_transfer_at')}
+        self.last_success = saved_status.get('last_success') or saved_progress.get('last_success')
         self.direction = 'checking'
         self.directions = {}
         self.pending = []
@@ -59,7 +63,7 @@ class SyncProgress:
     def begin(self):
         self.data = dict(phase='checking', bytes=0, total_bytes=0, speed=0,
             transfers=0, total_transfers=0, checks=0, total_checks=0,
-            active=[], started_at=now(), last_success=self.last_success)
+            active=[], started_at=now(), last_success=self.last_success, **self.timestamps)
         self.publish(force=True)
 
     def publish(self, force=False):
@@ -188,6 +192,8 @@ class SyncProgress:
         obj = row.get('object', '')
         if obj and row.get('objectType', row.get('object_type', '')) != 'directory':
             if re.search(r'(?:^| )Copied \(', message) or 'Multi-thread Copied' in message:
+                if Path(obj).name != '.twodrive-health':
+                    self.data['last_transfer_at']=now()
                 self.activity(obj, self.direction if self.direction in ('upload', 'download') else 'synced')
                 for item in self.data.get('active',[]):
                     if item['name']==obj and item.get('report_id'):
@@ -235,7 +241,7 @@ class SyncProgress:
             self.merge_backend()
             self.publish(force=True)
 
-    def finish(self, success):
+    def finish(self, success, *, synchronized=True):
         if success is None:
             self.merge_backend(include_error=True)
         self.data['phase'] = 'paused' if success is None else 'idle' if success else 'error'
@@ -249,7 +255,9 @@ class SyncProgress:
         self.data['speed'] = 0
         self.data['finished_at'] = now()
         if success:
-            self.last_success = self.data['last_success'] = now()
+            self.data['last_check_at']=now()
+            if synchronized:
+                self.last_success = self.data['last_success'] = self.data['last_sync_at'] = now()
         self.publish(force=True)
 
 

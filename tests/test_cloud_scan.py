@@ -205,7 +205,7 @@ class CloudScanTests(unittest.TestCase):
         checked=self.scan.index['checked_at']
         with self.assertRaisesRegex(RuntimeError,'计数不一致'):
             self.scan.prepare(set(),self.p)
-        self.assertEqual(checked,self.t.read_json(self.scan.path)['checked_at'])
+        self.assertEqual(checked,self.t.read_json(self.scan.receipt_path)['checked_at'])
 
     def test_folder_cycle_rejected(self):
         self.t.dirs['2']['parent']='2'

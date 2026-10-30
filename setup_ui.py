@@ -242,7 +242,7 @@ class Handler(BaseHTTPRequestHandler):
             if not (t.PRIVATE/'initialized.json').exists(): return self.send(409,'请先完成授权和测试。')
             # A scheduled task refuses a second concurrent instance.
             (t.ROOT/'runtime/stop').unlink(missing_ok=True)
-            if self.path=='/sync-now': (t.ROOT/'runtime/sync-now').touch()
+            (t.ROOT/'runtime/sync-now').touch()  # Also wake an action-required worker on resume.
             result=t.run(['schtasks.exe','/Run','/TN','TwoDrive-115-Sync'],check=False)
             if result.returncode:
                 t.run(['powershell.exe','-NoProfile','-ExecutionPolicy','Bypass','-File',t.ROOT/'install-startup.ps1'])

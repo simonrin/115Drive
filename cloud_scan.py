@@ -10,6 +10,7 @@ import hashlib
 import json
 import time
 from pathlib import PurePosixPath
+from sync_errors import ActionRequiredError, IndexInvalidError, ScanChangedError, recovery_policy
 
 
 def valid_names(rows):
@@ -17,20 +18,20 @@ def valid_names(rows):
     for row in rows:
         name = row['n']
         if not name or name in ('.', '..') or '/' in name or '\\' in name:
-            raise RuntimeError('云端文件名无法映射到 Windows')
+            raise ActionRequiredError('云端文件名无法映射到 Windows')
         key = name.casefold()
         if key in names:
-            raise RuntimeError('云端存在重复名称（含仅大小写不同），已停止同步：' + name)
+            raise ActionRequiredError('云端存在重复名称（含仅大小写不同），已停止同步：' + name)
         names.add(key)
 
 
 def file_key(row):
     sha = str(row.get('sha', '')).lower()
     if len(sha) != 40 or any(c not in '0123456789abcdef' for c in sha):
-        raise RuntimeError('115 文件校验信息不完整，已停止同步')
+        raise IndexInvalidError('115 文件校验信息不完整，已停止同步')
     size = int(row['s'])
     if size < 0:
-        raise RuntimeError('115 文件大小无效')
+        raise IndexInvalidError('115 文件大小无效')
     return (str(row['cid']), row['n'], size, sha)
 
 
@@ -46,13 +47,13 @@ def files_in(dirs):
             if row.get('fid'):
                 fid = str(row['fid'])
                 if fid in result:
-                    raise RuntimeError('115 文件被重复引用，已停止同步')
+                    raise IndexInvalidError('115 文件被重复引用，已停止同步')
                 result[fid] = file_key(row)
     return result
 
 
 class CloudScan:
-    VERSION = 2
+    VERSION = 3
 
     def __init__(self, owner, remote):
         if remote != 'cloud115:115Drive':
@@ -60,6 +61,9 @@ class CloudScan:
         self.t = owner
         self.remote = remote
         self.path = owner.PRIVATE / 'cloud-index.json'
+        self.receipt_path = owner.PRIVATE / 'cloud-index-verified.json'
+        self._content = None
+        self._digest = None
         self.index = None
         self.pending = set()
         self.audit_cursor = 0
@@ -70,17 +74,42 @@ class CloudScan:
         self.force_full = False
         try:
             saved = owner.read_json(self.path)
-            if saved.get('version') in (1, self.VERSION) and saved.get('remote') == remote:
+            if saved.get('version') in (1, 2, self.VERSION) and saved.get('remote') == remote:
                 files_in(saved['dirs'])  # Reject malformed persisted hints.
+                if saved['version'] == self.VERSION:
+                    self._content = copy.deepcopy(saved)
+                    self._digest = hashlib.sha256(self.path.read_bytes()).hexdigest()
+                    saved = dict(saved, checked_at=0, needs_sync=True)
+                    try:
+                        receipt = owner.read_json(self.receipt_path)
+                        if (receipt.get('version') == 1 and receipt.get('sha256') == self._digest
+                                and isinstance(receipt.get('needs_sync'), bool)):
+                            saved.update(checked_at=float(receipt['checked_at']), needs_sync=receipt['needs_sync'])
+                    except (OSError, ValueError, KeyError, TypeError):
+                        pass  # An uncommitted index remains pending across restart.
                 self.index = saved
         except (OSError, ValueError, KeyError, TypeError, RuntimeError):
             pass
+
+    def persist(self, index):
+        # Commit immutable content first, then a small SHA-256-bound receipt.
+        # A crash between the two leaves a mismatch, never a fresh stale index.
+        content = {k: v for k, v in index.items() if k not in ('checked_at', 'needs_sync')}
+        written = self._content != content
+        if written:
+            self.t.write_json(self.path, content)
+            self._digest = hashlib.sha256(self.path.read_bytes()).hexdigest()
+            self._content = copy.deepcopy(content)
+        self.t.write_json(self.receipt_path, dict(version=1, sha256=self._digest,
+            checked_at=index['checked_at'], needs_sync=index['needs_sync']))
+        self.index = index
+        return written
 
     def connect(self):
         self.token = self.t.login()
         record = next((r for r in self.t.storages(self.token) if r['mount_path'] == '/115'), None)
         if not record or record['driver'] != '115 Cloud' or record.get('remark') != 'Managed by TwoDrive':
-            raise RuntimeError('增量检查仅适用于 TwoDrive 管理的 115 Cloud 挂载')
+            raise ActionRequiredError('增量检查仅适用于 TwoDrive 管理的 115 Cloud 挂载')
         if record.get('cache_expiration', 0) < 60:
             # Scope checked above; retain every other storage setting.
             record['cache_expiration'] = 60
@@ -107,33 +136,33 @@ class CloudScan:
                 offset=len(rows), show_dir=0 if recursive else 1, cur=0 if recursive else 1,
                 limit=1150, format='json', snap=0, natsort=0, record_open_time=0, fc_mix=0), progress)
             if str(response.get('cid')) != str(cid):
-                raise RuntimeError('115 返回了不同目录，已停止同步')
+                raise IndexInvalidError('115 返回了不同目录，已停止同步')
             count = int(response['count'])
             if count < 0 or (expected_count is not None and count != expected_count):
-                raise RuntimeError('115 目录在分页时发生变化，稍后重新检查')
+                raise ScanChangedError('115 目录在分页时发生变化，稍后重新检查')
             expected_count = count
             ancestry = response.get('path')
             page = response.get('data')
             if not isinstance(page, list) or (not page and len(rows) < count):
-                raise RuntimeError('115 目录分页不完整，已停止同步')
+                raise IndexInvalidError('115 目录分页不完整，已停止同步')
             if int(response.get('offset', len(rows))) != len(rows):
-                raise RuntimeError('115 返回了重复分页，已停止同步')
+                raise IndexInvalidError('115 返回了重复分页，已停止同步')
             for row in page:
                 key = ('f', str(row['fid'])) if row.get('fid') else ('d', str(row['cid']))
                 if key in seen or (recursive and key[0] != 'f'):
-                    raise RuntimeError('115 批量清单不完整，已停止同步')
+                    raise IndexInvalidError('115 批量清单不完整，已停止同步')
                 seen.add(key)
                 if row.get('fid'):
                     file_key(row)
                 rows.append(row)
             if len(rows) > count:
-                raise RuntimeError('115 目录计数不一致，已停止同步')
+                raise IndexInvalidError('115 目录计数不一致，已停止同步')
             if progress and recursive:
                 progress.scan('115Drive', 0, len(rows), 'manifest' if recursive else 'incremental')
             if len(rows) == count:
                 break
         if not isinstance(ancestry, list):
-            raise RuntimeError('115 目录路径缺失，已停止同步')
+            raise IndexInvalidError('115 目录路径缺失，已停止同步')
         return rows, ancestry
 
     @staticmethod
@@ -144,13 +173,13 @@ class CloudScan:
         start = ids.index(str(root_id))
         parts = [item['name'] for item in ancestry[start:]]
         if not parts or parts[0] != '115Drive' or any('/' in p or '\\' in p or p in ('', '.', '..') for p in parts):
-            raise RuntimeError('115 目录路径无法安全映射')
+            raise IndexInvalidError('115 目录路径无法安全映射')
         return '/'.join(parts)
 
     def manifest(self, root_id, progress):
         rows, ancestry = self.listing(root_id, recursive=True, progress=progress)
         if self.relative_path(ancestry, root_id) != '115Drive':
-            raise RuntimeError('115 同步根目录路径发生变化')
+            raise IndexInvalidError('115 同步根目录路径发生变化')
         by_parent = {}
         result = {}
         for row in rows:
@@ -169,13 +198,13 @@ class CloudScan:
         actual = sorted((r['name'], r['is_dir'], int(r['size']) if not r['is_dir'] else 0)
                         for r in response['content'] or [])
         if expected != actual:
-            raise RuntimeError('网盘目录在检查时发生变化，已停止本轮并等待重试')
+            raise ScanChangedError('网盘目录在检查时发生变化，已停止本轮并等待重试')
 
     def refresh(self, dirs, cid, path, root_id, progress, *, full=False):
         old = dirs.get(cid)
         rows, ancestry = self.listing(cid, progress=progress)
         if self.relative_path(ancestry, root_id) != path:
-            raise RuntimeError('网盘目录位置已改变，下一轮将完整核对')
+            raise IndexInvalidError('网盘目录位置已改变，下一轮将完整核对')
         valid_names(rows)
         changed = old is None or old['path'] != path or signature(old['rows']) != signature(rows)
         if full or changed:
@@ -216,10 +245,10 @@ class CloudScan:
         if not pickcode:
             rows = self.request('files/file', {'file_id': root_id}, progress).get('data')
             if not isinstance(rows, list) or len(rows) != 1 or str(rows[0]['file_id']) != root_id or rows[0]['file_name'] != '115Drive':
-                raise RuntimeError('115 同步根目录信息不匹配')
+                raise IndexInvalidError('115 同步根目录信息不匹配')
             pickcode = rows[0]['pick_code']
         if not pickcode:
-            raise RuntimeError('115 同步根目录提取码缺失')
+            raise IndexInvalidError('115 同步根目录提取码缺失')
         self.root_pickcode = pickcode
         tree = {}
         expected = None
@@ -227,25 +256,25 @@ class CloudScan:
         while True:
             data = self.request('files/downfolders', dict(pickcode=pickcode, page=page, per_page=5000), progress)['data']
             if str(data['root']['fid']) != root_id or data['root']['fn'] != '115Drive':
-                raise RuntimeError('115 批量目录根节点不匹配')
+                raise IndexInvalidError('115 批量目录根节点不匹配')
             count = int(data['count'])
             if count < 0 or (expected is not None and count != expected):
-                raise RuntimeError('115 批量目录计数发生变化')
+                raise ScanChangedError('115 批量目录计数发生变化')
             expected = count
             rows = data['list']
             if not isinstance(rows, list) or not isinstance(data['has_next_page'], bool):
-                raise RuntimeError('115 批量目录分页无效')
+                raise IndexInvalidError('115 批量目录分页无效')
             for r in rows:
                 cid, parent = str(r['fid']), str(r['pid'])
                 if cid in tree or cid == root_id or cid == parent:
-                    raise RuntimeError('115 批量目录重复或存在循环')
+                    raise IndexInvalidError('115 批量目录重复或存在循环')
                 valid_names([dict(n=r['fn'])])
                 tree[cid] = (parent, r['fn'])
             if len(tree) > count or (data['has_next_page'] and (not rows or len(tree) >= count)):
-                raise RuntimeError('115 批量目录分页不完整')
+                raise IndexInvalidError('115 批量目录分页不完整')
             if not data['has_next_page']:
                 if len(tree) != count:
-                    raise RuntimeError('115 批量目录计数不一致')
+                    raise IndexInvalidError('115 批量目录计数不一致')
                 break
             page += 1
         # Reject disconnected/cyclic data before using it to infer deletions.
@@ -254,7 +283,7 @@ class CloudScan:
             chain = set()
             while cid not in connected:
                 if cid in chain or cid not in tree:
-                    raise RuntimeError('115 批量目录路径不完整')
+                    raise IndexInvalidError('115 批量目录路径不完整')
                 chain.add(cid)
                 cid = tree[cid][0]
             connected.update(chain)
@@ -280,9 +309,9 @@ class CloudScan:
         self.connect()
         root_id = str(self.request('files/getid', {'path': '115Drive'}, progress).get('id', ''))
         if not root_id or root_id == '0':
-            raise RuntimeError('115 同步根目录不可访问，已停止同步')
+            raise ActionRequiredError('115 同步根目录不可访问，已停止同步')
         if self.index and self.index['root_id'] != root_id:
-            raise RuntimeError('115 同步根目录已被替换，需检查原同步历史')
+            raise ActionRequiredError('115 同步根目录已被替换，需检查原同步历史')
         mode = 'incremental'
         try:
             tree = self.folder_tree(root_id, progress)
@@ -300,7 +329,7 @@ class CloudScan:
                 # Confirm a changed paginated manifest before propagating deletes.
                 topology_changed = tree != self.tree_in(dirs)
                 if (live != before or topology_changed) and (self.manifest(root_id, progress) != live or self.folder_tree(root_id, progress) != tree):
-                    raise RuntimeError('网盘文件仍在变化，稍后重新检查')
+                    raise ScanChangedError('网盘文件仍在变化，稍后重新检查')
                 dirty = self.folder_changes(dirs, tree) | self.pending | {root_id}
                 changed = changed or bool(dirty - {root_id})
                 resolved_parents = {}
@@ -317,7 +346,7 @@ class CloudScan:
                                     if parent not in resolved_parents:
                                         _, ancestry = self.listing(parent, progress=progress)
                                         if self.relative_path(ancestry, root_id) is None:
-                                            raise RuntimeError('网盘文件位置在检查期间变化')
+                                            raise ScanChangedError('网盘文件位置在检查期间变化')
                                         known = [str(a['cid']) for a in ancestry if str(a['cid']) in dirs]
                                         resolved_parents[parent] = known[-1]
                                     dirty.add(resolved_parents[parent])
@@ -342,35 +371,37 @@ class CloudScan:
                     if cid in dirs:
                         changed = self.refresh(dirs, cid, dirs[cid]['path'], root_id, progress) or changed
             if files_in(dirs) != live:
-                raise RuntimeError('增量目录与完整文件清单不一致，下一轮将完整核对')
+                raise IndexInvalidError('增量目录与完整文件清单不一致，下一轮将完整核对')
             if self.tree_in(dirs) != tree:
-                raise RuntimeError('增量目录与完整目录树不一致，下一轮将完整核对')
+                raise IndexInvalidError('增量目录与完整目录树不一致，下一轮将完整核对')
             if not any(r.get('fid') and r['n'] == self.t.SENTINEL for r in dirs[root_id]['rows']):
-                raise RuntimeError('网盘健康标记缺失，已停止同步')
-            self.index = dict(version=self.VERSION, remote=self.remote, root_id=root_id,
+                raise ActionRequiredError('网盘健康标记缺失，已停止同步')
+            index = dict(version=self.VERSION, remote=self.remote, root_id=root_id,
                               identity=self.identity, dirs=dirs, checked_at=time.time(),
                               root_pickcode=self.root_pickcode, tree_verified=True)
             # A freshly observed cloud change must remain pending until rclone
             # succeeds. A failed transfer/restart must never acknowledge it.
-            self.index['needs_sync'] = changed
-            self.t.write_json(self.path, self.index)
+            index['needs_sync'] = changed
+            index_written = self.persist(index)
             self.pending.clear()
             self.force_full = False
             report = dict(mode=mode, seconds=round(time.monotonic()-started, 3),
                           native_requests=self.requests, files=len(live), directories=len(dirs),
-                          changed=changed, checked_at=self.index['checked_at'])
+                          changed=changed, checked_at=self.index['checked_at'],
+                          index_written=index_written, index_bytes=self.path.stat().st_size,
+                          receipt_bytes=self.receipt_path.stat().st_size)
             self.t.write_json(self.t.ROOT/'runtime/scan-metrics.json', report)
             return changed
         except self.t.SyncPaused:
             raise
-        except Exception:
-            self.force_full = True
+        except Exception as error:
+            if recovery_policy(error).rebuild_index:
+                self.force_full = True
             raise
 
     def synchronized(self):
         if self.index:
-            self.index['needs_sync'] = False
-            self.t.write_json(self.path, self.index)
+            self.persist(dict(self.index, needs_sync=False))
 
     def audit_step(self):
         """One read-only directory per idle worker turn; never block on a full walk."""

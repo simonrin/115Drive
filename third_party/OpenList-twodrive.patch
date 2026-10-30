@@ -111,7 +111,7 @@
  func init() {
 --- a/OpenList-4.2.6/drivers/115/startup_cache.go
 +++ b/OpenList-4.2.6/drivers/115/startup_cache.go
-@@ -0,0 +1,137 @@
+@@ -0,0 +1,163 @@
 +package _115
 +
 +// TwoDrive's private instance can seed its empty memory cache from a complete
@@ -123,6 +123,7 @@
 +	"encoding/json"
 +	"fmt"
 +	"os"
++	"path/filepath"
 +	"strings"
 +	"sync"
 +	"time"
@@ -147,6 +148,14 @@
 +	Dirs         map[string]verifiedDirectory `json:"dirs"`
 +}
 +
++// Version 3 stores content only when it changes. The small receipt binds a
++// fresh verification to the exact bytes; a torn two-file commit fails closed.
++type verifiedReceipt struct {
++	Version   int     `json:"version"`
++	SHA256    string  `json:"sha256"`
++	CheckedAt float64 `json:"checked_at"`
++}
++
 +type verifiedStartupCache struct {
 +	mu       sync.Mutex
 +	path     string
@@ -154,6 +163,7 @@
 +	modified time.Time
 +	size     int64
 +	index    *verifiedIndex
++	digest   string
 +	used     map[string]bool
 +	disabled bool
 +	restored int
@@ -207,12 +217,28 @@
 +			return nil, false
 +		}
 +		c.index = &idx
++		digest := sha256.Sum256(data)
++		c.digest = hex.EncodeToString(digest[:])
 +		c.modified, c.size = st.ModTime(), st.Size()
 +	}
 +	idx := c.index
 +	identity := sha256.Sum256([]byte(fmt.Sprint(d.Storage.ID) + d.Cookie))
-+	checked := time.Unix(0, int64(idx.CheckedAt*1e9))
-+	if idx.Version != 2 || idx.Remote != "cloud115:115Drive" || !idx.TreeVerified ||
++	checkedAt := idx.CheckedAt
++	if idx.Version == 3 {
++		path := filepath.Join(filepath.Dir(c.path), "cloud-index-verified.json")
++		info, err := os.Stat(path)
++		if err != nil || info.Size() > 4096 {
++			return nil, false
++		}
++		data, err := os.ReadFile(path)
++		var receipt verifiedReceipt
++		if err != nil || json.Unmarshal(data, &receipt) != nil || receipt.Version != 1 || receipt.SHA256 != c.digest {
++			return nil, false
++		}
++		checkedAt = receipt.CheckedAt
++	}
++	checked := time.Unix(0, int64(checkedAt*1e9))
++	if (idx.Version != 2 && idx.Version != 3) || idx.Remote != "cloud115:115Drive" || !idx.TreeVerified ||
 +		idx.Identity != hex.EncodeToString(identity[:]) || checked.Before(c.started) ||
 +		time.Since(checked) < 0 || time.Since(checked) > 120*time.Second ||
 +		idx.Dirs[idx.RootID].Path != "115Drive" {
@@ -251,7 +277,7 @@
 +}
 --- a/OpenList-4.2.6/drivers/115/startup_cache_test.go
 +++ b/OpenList-4.2.6/drivers/115/startup_cache_test.go
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,126 @@
 +package _115
 +
 +import (
@@ -333,6 +359,47 @@
 +			write()
 +			if _, ok := d.restoreVerifiedDirectory("1", false); ok {
 +				t.Fatal("unsafe snapshot accepted")
++			}
++		})
++	}
++}
++
++func TestTwoDriveReceiptBindsFreshnessToExactContent(t *testing.T) {
++	for _, mode := range []string{"valid", "missing", "mismatch", "expired", "before-start", "future", "content-changed", "unverified"} {
++		t.Run(mode, func(t *testing.T) {
++			d, idx, write := testStartupDriver(t)
++			idx["version"] = 3
++			delete(idx, "checked_at")
++			write()
++			data, _ := os.ReadFile(d.startupCache.path)
++			sum := sha256.Sum256(data)
++			receipt := verifiedReceipt{Version: 1, SHA256: hex.EncodeToString(sum[:]), CheckedAt: float64(time.Now().UnixMilli()) / 1000}
++			switch mode {
++			case "mismatch":
++				receipt.SHA256 = "wrong"
++			case "expired":
++				receipt.CheckedAt -= 180
++				d.startupCache.started = time.Now().Add(-time.Hour)
++			case "before-start":
++				d.startupCache.started = time.Now().Add(time.Second)
++			case "future":
++				receipt.CheckedAt += 60
++			case "content-changed":
++				idx["root_pickcode"] = "changed"
++				write()
++			case "unverified":
++				idx["tree_verified"] = false
++				write()
++			}
++			if mode != "missing" {
++				blob, _ := json.Marshal(receipt)
++				if err := os.WriteFile(filepath.Join(filepath.Dir(d.startupCache.path), "cloud-index-verified.json"), blob, 0600); err != nil {
++					t.Fatal(err)
++				}
++			}
++			_, ok := d.restoreVerifiedDirectory("1", false)
++			if ok != (mode == "valid") {
++				t.Fatalf("mode %s accepted=%v", mode, ok)
 +			}
 +		})
 +	}

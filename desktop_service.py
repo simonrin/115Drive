@@ -12,7 +12,7 @@ def defaults(root):
     (root/'logs').mkdir(exist_ok=True)
     if not t.CONFIG.exists():
         t.write_json(t.CONFIG,dict(local_path=str(Path.home()/'115Drive'),remote_path='cloud115:115Drive',
-            remote_backup='cloud115:115Drive_Recovery_AutoSync',recovery_enabled=False,local_scan_seconds=2,debounce_seconds=3,
+            remote_backup='cloud115:115Drive_Recovery_AutoSync',recovery_enabled=False,local_scan_seconds=2,local_watch_enabled=True,local_full_scan_seconds=60,debounce_seconds=3,
             cloud_poll_seconds=15,incremental_scan=True,local_hash_cache=True,local_namespace='virtual_v1',start_with_windows=True))
 
 
