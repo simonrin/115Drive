@@ -25,4 +25,4 @@
 
 默认 60 秒兜底、监听失败时按 2 秒轮询，并在 30 秒后尝试重建监听；当前同步或重试操作可能延后扫描执行。网络故障试验仅作用于临时同步进程的连接，没有断开整机网络，也没有验证整机重启。本机结果不代表所有 Windows 版本和网络环境。
 
-`main` 的源码更新与 GitHub Release 二进制发布分开进行。复现单元测试使用 `python -X utf8 -B -m unittest discover -s tests -p "test_*.py"`；真实云端验证需要自行授权并使用独立测试目录。
+这些优化已纳入 v0.2.1 发布内容。复现单元测试使用 `python -X utf8 -B -m unittest discover -s tests -p "test_*.py"`；真实云端验证需要自行授权并使用独立测试目录。

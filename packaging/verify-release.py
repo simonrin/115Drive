@@ -33,7 +33,7 @@ def main():
         assert Path(name).name==name and name not in hashes,'Invalid checksum filename'
         assert digest((release/name).read_bytes())==value,'Release checksum mismatch: '+name
         hashes[name]=value
-    names=['115Drive-Setup-0.2.0-x64.exe','115Drive-0.2.0-windows-x64.zip','115Drive-0.2.0-source.zip']
+    names=['115Drive-Setup-0.2.1-x64.exe','115Drive-0.2.1-windows-x64.zip','115Drive-0.2.1-source.zip']
     assert all(name in hashes for name in names),'Missing release assets'
     app=work/'app'
     process=subprocess.run([str(release/names[0]),'--extract-only',str(app)],
@@ -59,7 +59,7 @@ def main():
         frozen=CArchiveReader(str(app/'service/TwoDrive.Service.exe'))
         pyz=frozen.open_embedded_archive('PYZ.pyz')
         modules=['twodrive','setup_ui','sync_progress','transfer_recovery','cloud_scan','auth115',
-                 'desktop_settings','folder_change','local_paths']
+                 'desktop_settings','folder_change','local_paths','sync_errors','local_watch']
         for name in modules:
             expected=compile(source.read(name+'.py'),name+'.py','exec',dont_inherit=True)
             assert canonical(expected)==canonical(pyz.extract(name)),'Frozen module differs: '+name

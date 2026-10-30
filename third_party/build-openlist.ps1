@@ -12,6 +12,6 @@ Push-Location $source
 try {
     & $Go test ./internal/twodrive_resume ./drivers/115/... ./internal/op -run TwoDrive -count=1
     if ($LASTEXITCODE) { throw 'OpenList regression tests failed' }
-    & $Go build -trimpath -ldflags '-s -w -X github.com/OpenListTeam/OpenList/v4/internal/conf.Version=v4.2.6 -X github.com/OpenListTeam/OpenList/v4/internal/conf.WebVersion=v4.2.6 -X github.com/OpenListTeam/OpenList/v4/internal/conf.GitCommit=twodrive-resume-tray-20261020' -o (Join-Path $output 'openlist.exe') .
+    & $Go build -trimpath -ldflags '-s -w -X github.com/OpenListTeam/OpenList/v4/internal/conf.Version=v4.2.6 -X github.com/OpenListTeam/OpenList/v4/internal/conf.WebVersion=v4.2.6 -X github.com/OpenListTeam/OpenList/v4/internal/conf.GitCommit=twodrive-sync-0.2.1' -o (Join-Path $output 'openlist.exe') .
     if ($LASTEXITCODE) { throw 'OpenList build failed' }
 } finally { Pop-Location }

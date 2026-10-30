@@ -5,8 +5,8 @@
 - 建议仓库名：`115Drive`
 - 简介：`Windows 115 网盘双向同步工具，原生托盘与设置，支持暂停续传和重启恢复。`
 - Topics：`115drive`、`windows`、`file-sync`、`rclone`、`openlist`、`wpf`、`python`
-- Release 标题：`115Drive v0.2.0 — Windows 双向同步与断点续传`
-- Tag：`v0.2.0`
+- Release 标题：`115Drive v0.2.1 — Windows 双向同步与断点续传`
+- Tag：`v0.2.1`
 - 本版建议勾选 **Set as a pre-release**，因为当前为单机验证的公开测试版。
 
 ## 应提交的内容
@@ -23,11 +23,11 @@
 git init -b main
 git add .
 git status --short
-git commit -m "feat: release 115Drive v0.2.0"
+git commit -m "feat: release 115Drive v0.2.1"
 git remote add origin https://github.com/OWNER/115Drive.git
 git push -u origin main
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.2.1
+git push origin v0.2.1
 ```
 
 `OWNER` 是需要替换的占位符。提交前检查本机 Git 的作者姓名和邮箱，若不想公开个人邮箱，
@@ -35,12 +35,12 @@ git push origin v0.2.0
 
 ## 创建 Release
 
-在仓库的 **Releases → Draft a new release** 中选择 `v0.2.0`。
-将 [v0.2.0 发布说明](releases/v0.2.0.md) 全文粘贴到说明栏，再上传：
+在仓库的 **Releases → Draft a new release** 中选择 `v0.2.1`。
+将 [v0.2.1 发布说明](releases/v0.2.1.md) 全文粘贴到说明栏，再上传：
 
-1. `115Drive-Setup-0.2.0-x64.exe`
-2. `115Drive-0.2.0-windows-x64.zip`
-3. `115Drive-0.2.0-source.zip`
+1. `115Drive-Setup-0.2.1-x64.exe`
+2. `115Drive-0.2.1-windows-x64.zip`
+3. `115Drive-0.2.1-source.zip`
 4. `SHA256SUMS.txt`
 
 源码应和二进制一同发布，保留 `third_party/` 内对应的修改版 OpenList 和前端源码、

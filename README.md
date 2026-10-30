@@ -4,11 +4,11 @@ Windows 上的 115 网盘双向同步工具，提供原生托盘、同步进度�
 
 > 社区项目，非 115 官方客户端。使用普通网盘会话连接；接口可能变化，失效时需重新扫码。
 
-**当前版本：0.2.0 · Windows 10/11 x64**
+**当前版本：0.2.1 · Windows 10/11 x64**
 
-`main` 分支还包含下述未发布优化；已有 v0.2.0 Release 附件不会随源码提交自动更新。
+本版安装包、便携包与源码包均包含下述优化，仍保持公开测试版标记。
 
-## 未发布更新
+## 0.2.1 更新
 
 - 本地文件变化由 Windows 递归事件通知触发核对，每 60 秒完整扫描兜底；监听失败时退回 2 秒轮询，并自动重新建立监听。
 - 云端索引和本地快照仅在内容变化时写入，云端核验时间使用独立的小型记录保存。
@@ -123,10 +123,10 @@ powershell -ExecutionPolicy Bypass -File packaging/build-release.ps1
 
 安装包未进行代码签名；发布前可使用自己的代码签名证书签名。当前机器验证不等于已在所有 Windows 版本上验证。
 
-下载后可运行 `Get-FileHash .\115Drive-Setup-0.2.0-x64.exe -Algorithm SHA256`，
+下载后可运行 `Get-FileHash .\115Drive-Setup-0.2.1-x64.exe -Algorithm SHA256`，
 与同一 Release 的校验清单对比。安装器只支持空目录，暂不提供自动升级。
 
-发布者可直接使用 [GitHub 发布步骤](docs/PUBLISHING.md) 和 [v0.2.0 发布说明](docs/releases/v0.2.0.md)。
+发布者可直接使用 [GitHub 发布步骤](docs/PUBLISHING.md) 和 [v0.2.1 发布说明](docs/releases/v0.2.1.md)。
 源码贡献见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 本项目代码使用 MIT 许可证；第三方组件保留原许可证，见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
