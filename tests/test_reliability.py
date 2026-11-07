@@ -197,7 +197,8 @@ class ReliabilityTests(unittest.TestCase):
             return real_write(path, data, **kwargs)
         with patch.object(r, 'atomic_write_json', side_effect=write):
             fixture.changer.change(str(fixture.target))
-        self.assertEqual(t.read_json(fixture.CONFIG)['local_path'], str(fixture.target))
+        # Runner temp directories may use 8.3 aliases for the same directory.
+        self.assertTrue(Path(t.read_json(fixture.CONFIG)['local_path']).samefile(fixture.target))
         self.assertFalse(fixture.changer.guard.exists())
         self.assertEqual((fixture.source/'子目录/测试.txt').read_bytes(),
                          (fixture.target/'子目录/测试.txt').read_bytes())

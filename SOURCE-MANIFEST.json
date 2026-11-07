@@ -61,7 +61,7 @@
   "tests/test_permissions.py": "0ed8401519b2e266bc81f6916987faca23a5eab7d1999064f75c9e85f6c5d007",
   "tests/test_reconnection.py": "7d3f9544d3d43ab8a7983cb87935c8de43ee539b59df6fc133551770a40b87e0",
   "tests/test_recovery_preflight.py": "c6833b8b15905c3d346ba76af70615cbcf5ca62d4b46d262a625838ff3bc019b",
-  "tests/test_reliability.py": "465b46faf9625d26cbc1fa772bde78d705e6b559bd47ffb8c4fc805855560f70",
+  "tests/test_reliability.py": "f78462f270e9875dfd9814aa09460104d6d21bdb0772b2db45791762a8c111dd",
   "tests/test_runtime_json.py": "e2ce4e24bf5a0fc1156f7089fd0dfd3ea5c590e8604a10c43328730a83fd7a23",
   "tests/test_snapshot.py": "ef8006545a835a4fd2925c846919d2d5f6a1dc6564a93ab7d1eb94d505d63e10",
   "tests/test_sync_optimization.py": "66163668d8665e03e7b12414ed2b61b78323a2bdbeafe5bedc0506e588b63078",
