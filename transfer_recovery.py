@@ -13,6 +13,8 @@ import secrets
 import stat
 import subprocess
 import time
+from runtime_json import atomic_write_json, write_snapshot
+from sync_errors import TransientSyncError
 
 
 def partial_suffix(run_id):
@@ -22,14 +24,7 @@ def partial_suffix(run_id):
 
 
 def save(path, value):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(path.name + '.tmp')
-    with temp.open('w', encoding='utf-8') as stream:
-        json.dump(value, stream, ensure_ascii=False)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temp, path)
+    atomic_write_json(path, value, durable=True)
 
 
 def ordinary(path):
@@ -149,7 +144,7 @@ class TransferRecovery:
         if self.load() is None:
             return False
         if self.alive():
-            raise RuntimeError('上次的 rclone 传输进程仍在运行，等待结束后恢复。')
+            raise TransientSyncError('上次的 rclone 传输进程仍在运行，等待结束后恢复。')
         # Rclone --recover uses its saved listings. Only release this run's
         # stale lock after confirming no rclone process can still own it.
         locks = 0
@@ -160,7 +155,7 @@ class TransferRecovery:
             if root_identity(self.workdir) != self.record['work_identity']:
                 raise RuntimeError('同步历史目录已替换，已停止恢复。')
             try:
-                lock = json.loads(file.read_text())
+                lock = json.loads(file.read_text(encoding='utf-8-sig'))
                 owned_process = (str(lock['PID']) == str(self.record['pid']) and
                                  Path(lock['Session']).absolute() == file.with_suffix('').absolute())
             except (ValueError, KeyError, TypeError):
@@ -172,7 +167,7 @@ class TransferRecovery:
         for file in checked_locks:
             checked_file(file,self.workdir).unlink()
             locks += 1
-        save(self.report, dict(state='retrying', cleaned_files=count, cleaned_bytes=size,
+        write_snapshot(self.report, dict(state='retrying', cleaned_files=count, cleaned_bytes=size,
                                released_locks=locks, updated_at=time.time()))
         return True
 
@@ -198,7 +193,7 @@ class TransferRecovery:
     def complete(self):
         count, size = self.clean_partials()
         self.path.unlink()
-        save(self.report, dict(state='complete', cleaned_files=count, cleaned_bytes=size,
+        write_snapshot(self.report, dict(state='complete', cleaned_files=count, cleaned_bytes=size,
                                updated_at=time.time()))
 
 
@@ -212,7 +207,7 @@ def prepare_openlist_scratch(private):
     identity=root_identity(directory)
     if not ordinary(marker):
         raise RuntimeError('上传临时目录异常，已停止清理。')
-    if json.loads(marker.read_text()) != {'owner':'TwoDrive.OpenList','version':1,'identity':identity}:
+    if json.loads(marker.read_text(encoding='utf-8-sig')) != {'owner':'TwoDrive.OpenList','version':1,'identity':identity}:
         raise RuntimeError('上传临时目录没有有效归属记录，已停止清理。')
     count = size = 0
     for file in directory.iterdir():

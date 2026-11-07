@@ -39,7 +39,7 @@ class Fixture:
         self.write_json(self.PRIVATE / 'initialized.json', dict(local=str(self.source), remote='cloud115:115Drive', filter_sha256='fixture'))
         self.write_json(self.PRIVATE / 'local-snapshot.json', dict(local=str(self.source), remote='cloud115:115Drive', entries={'pending.txt':[10,20]}))
         (self.PRIVATE / 'rclone.conf').write_text('[cloud115]\ntype = alias\nremote = '+self.base.as_posix()+'/remote\n'
-                                                 '\n[localhash]\ntype = hasher\nremote = '+self.base.as_posix()+'\nhashes = sha1\nmax_age = 24h\n')
+                                                 '\n[localhash]\ntype = hasher\nremote = '+self.base.as_posix()+'\nhashes = sha1\nmax_age = 24h\n', encoding='utf-8')
         self.history = self.PRIVATE / 'bisync-cached'
         self.history.mkdir()
         for suffix in ('path1.lst', 'path2.lst'):
@@ -83,7 +83,7 @@ class FolderChangeTests(unittest.TestCase):
         self.assertTrue((f.ROOT / 'runtime/stop').exists())
         self.assertFalse(f.changer.guard.exists())
         self.assertEqual(history, {p.name:p.read_bytes() for p in f.history.iterdir()})
-        mapping = (f.PRIVATE / 'rclone.conf').read_text()
+        mapping = (f.PRIVATE / 'rclone.conf').read_text(encoding='utf-8')
         self.assertIn('remote = localview:', mapping)
         self.assertIn('"115Drive=', mapping)
 

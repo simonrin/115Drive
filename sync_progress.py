@@ -10,6 +10,7 @@ import re
 import subprocess
 import threading
 import time
+from runtime_json import write_snapshot
 
 
 def now():
@@ -18,17 +19,14 @@ def now():
 
 def load(path, default):
     try:
-        return json.loads(Path(path).read_text(encoding='utf-8-sig'))
+        value = json.loads(Path(path).read_text(encoding='utf-8-sig'))
+        return value if isinstance(value, type(default)) else default
     except (OSError, ValueError):
         return default
 
 
 def write(path, data):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix('.tmp')
-    temp.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
-    temp.replace(path)
+    return write_snapshot(path, data)
 
 
 class SyncPaused(Exception):
@@ -40,7 +38,9 @@ class SyncProgress:
         self.root = Path(root)
         self.path = self.root / 'runtime/progress.json'
         activities = load(self.root / 'runtime/activity.json', [])
-        self.activities = [x for x in activities if x.get('action') != 'backup'][-60:] if isinstance(activities,list) else []
+        self.activities = [x for x in activities if isinstance(x,dict)
+                           and isinstance(x.get('name'),str) and x['name']
+                           and x.get('action') in ('upload','download','synced','deleted')][-60:]
         saved_status=load(self.root/'runtime/status.json',{})
         saved_progress=load(self.path,{})
         self.timestamps={key:saved_status.get(key) or saved_progress.get(key) for key in
@@ -57,6 +57,7 @@ class SyncProgress:
         self.completed_reports = set()
         self.data = {}
         self.last_save = 0
+        self.activities_dirty = False
         self.cancelled = lambda: False
         self.begin()
 
@@ -71,6 +72,8 @@ class SyncProgress:
             return
         self.data['updated_at'] = now()
         write(self.path, self.data)
+        if self.activities_dirty:
+            self.activities_dirty = not write(self.root/'runtime/activity.json', self.activities)
         self.last_save = time.monotonic()
 
     def activity(self, name, action):
@@ -81,7 +84,7 @@ class SyncProgress:
             if item['time'][:19] == self.activities[-1]['time'][:19]:
                 return
         self.activities = (self.activities + [item])[-60:]
-        write(self.root / 'runtime/activity.json', self.activities)
+        self.activities_dirty = not write(self.root / 'runtime/activity.json', self.activities)
 
     def scan(self, path, directories, items, stage):
         if self.cancelled():
@@ -182,14 +185,20 @@ class SyncProgress:
                              speed=sum(x['speed'] for x in active))
 
     def feed(self, row):
-        message = row.get('msg', '')
+        if not isinstance(row,dict):
+            return
+        message = row.get('msg') or ''
+        if not isinstance(message,str):
+            return
         if 'Do queued copies to' in message:
             self.direction = 'download' if re.search(r'Path1\s*$', message) else 'upload'
         if 'Queue delete' in message:
             match = re.search(r'Queue delete\s+-\s+(.*)$', message)
             if match:
                 self.pending.append(match.group(1).replace('\\', '/').rsplit('/', 1)[-1])
-        obj = row.get('object', '')
+        obj = row.get('object') or ''
+        if not isinstance(obj,str):
+            obj = ''
         if obj and row.get('objectType', row.get('object_type', '')) != 'directory':
             if re.search(r'(?:^| )Copied \(', message) or 'Multi-thread Copied' in message:
                 if Path(obj).name != '.twodrive-health':
@@ -205,13 +214,18 @@ class SyncProgress:
                 self.activity(obj, 'deleted')
         stats = row.get('stats')
         if isinstance(stats, dict):
+            def number(value):
+                return max(0,value) if isinstance(value,(int,float)) and math.isfinite(value) else 0
             for src, dst in [('bytes','bytes'), ('totalBytes','total_bytes'),
                 ('speed','speed'), ('transfers','transfers'), ('totalTransfers','total_transfers'),
                 ('checks','checks'), ('totalChecks','total_checks'),('listed','listed')]:
-                self.data[dst] = max(0, stats.get(src) or 0)
+                self.data[dst] = number(stats.get(src))
             self.data['eta'] = stats.get('eta')
             active = []
-            for item in stats.get('transferring') or []:
+            transferring=stats.get('transferring')
+            for item in transferring if isinstance(transferring,list) else []:
+                if not isinstance(item,dict) or not isinstance(item.get('name'),str):
+                    continue
                 name = item.get('name', '')
                 if name.endswith('.twodrive-health'):
                     continue
@@ -223,10 +237,10 @@ class SyncProgress:
                 direction = self.directions.get(name, self.direction)
                 if direction in ('upload','download'):
                     self.direction = direction
-                count, size = max(0,item.get('bytes') or 0), max(0,item.get('size') or 0)
+                count, size = number(item.get('bytes')), number(item.get('size'))
                 active.append(dict(name=name, direction=direction, bytes=count, size=size,
                     percentage=min(100,100*count/size) if size else None,
-                    speed=max(0,item.get('speed') or 0), eta=item.get('eta')))
+                    speed=number(item.get('speed')), eta=item.get('eta')))
             self.raw_active = active
             self.data['active'] = active
             self.data['phase'] = 'transferring' if active else 'checking'
@@ -283,6 +297,7 @@ def execute(args, progress, log_path):
     done = threading.Event()
     paused = threading.Event()
     watcher = None
+    process = None
     try:
         process = subprocess.Popen(cleaned, cwd=progress.root,
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
@@ -339,4 +354,21 @@ def execute(args, progress, log_path):
         done.set()
         if watcher is not None:
             watcher.join()
-        handler.close()
+        try:
+            # Any unexpected log/consumer exception must leave no orphan writer.
+            # The durable transfer intent is retained for the next --recover.
+            if process is not None:
+                if process.poll() is None:
+                    try:
+                        process.terminate()
+                    except OSError:
+                        if process.poll() is None:
+                            raise
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+                process.stderr.close()
+        finally:
+            handler.close()

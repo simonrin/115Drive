@@ -21,7 +21,8 @@ import urllib.request
 import urllib.parse
 from local_watch import LocalChangeMonitor
 from sync_progress import SyncProgress, SyncPaused, execute as execute_sync
-from sync_errors import ActionRequiredError, TransientSyncError, recovery_policy
+from sync_errors import ActionRequiredError, TransientSyncError, IndexInvalidError, ScanChangedError, recovery_policy
+from runtime_json import atomic_write_json, write_snapshot
 
 ROOT = Path(os.environ.get('TWODRIVE_HOME', Path(__file__).resolve().parent)).resolve()
 PRIVATE = ROOT / 'runtime' / 'private'
@@ -36,34 +37,52 @@ HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 log = logging.getLogger('twodrive')
 _native_last_request = 0.0
 _incremental_scanners = {}
+_wait_status_failed = False
 
 def read_json(path):
     return json.loads(Path(path).read_text(encoding='utf-8-sig'))
 
 def write_json(path, value):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + '.' + secrets.token_hex(4) + '.tmp')
-    tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
-    os.replace(tmp, path)
+    atomic_write_json(path, value, indent=2)
 
 def status(state, message, **extra):
     try:
         previous=read_json(ROOT/'runtime/status.json')
+        if not isinstance(previous,dict): previous={}
         # A completed file may precede a later failure in the same bisync run.
         # Preserve that observed transfer without claiming the run succeeded.
         try:
-            observed=read_json(ROOT/'runtime/progress.json').get('last_transfer_at')
-            if observed and observed > previous.get('last_transfer_at',''):
+            progress=read_json(ROOT/'runtime/progress.json')
+            observed=progress.get('last_transfer_at') if isinstance(progress,dict) else None
+            prior_transfer=previous.get('last_transfer_at')
+            if isinstance(observed,str) and observed > (prior_transfer if isinstance(prior_transfer,str) else ''):
                 previous['last_transfer_at']=observed
         except (OSError,ValueError): pass
         for field in ('last_success','last_check_at','last_sync_at','last_transfer_at'):
-            if previous.get(field) and field not in extra:
+            if isinstance(previous.get(field),str) and previous[field] and field not in extra:
                 extra[field]=previous[field]
     except (OSError,ValueError): pass
     write_json(ROOT / 'runtime/status.json', dict(state=state, message=message,
         updated_at=dt.datetime.now().astimezone().isoformat(), **extra))
     log.info('%s: %s', state, message)
+
+
+def wait_status(state, message, **extra):
+    """A failed display write must not kill a worker already waiting safely.
+
+    Normal transitions remain strict: no transfer or success checkpoint is
+    allowed to proceed on a failed state write. Callers retry this while idle.
+    """
+    global _wait_status_failed
+    try:
+        status(state, message, **extra)
+    except OSError:
+        if not _wait_status_failed:
+            log.warning('Worker state write deferred; worker remains waiting')
+        _wait_status_failed=True
+        return False
+    _wait_status_failed=False
+    return True
 
 def run(args, *, timeout=180, data=None, check=True):
     p = subprocess.run([str(x) for x in args], input=data, capture_output=True,
@@ -133,15 +152,17 @@ def _ensure_server():
     except Exception:
         with contextlib.closing(socket.socket()) as sock:
             if sock.connect_ex(('127.0.0.1',5244)) == 0:
-                raise RuntimeError('Port 5244 is occupied by another service; not changing it')
+                # Re-raise the actual auth/network error without launching a
+                # second server or changing whatever occupies the port.
+                raise
     from transfer_recovery import prepare_openlist_scratch, server_process_running
     if server_process_running(OPENLIST):
-        raise RuntimeError('上次的上传服务进程尚未退出，等待结束后恢复。')
+        raise TransientSyncError('上次的上传服务进程尚未退出，等待结束后恢复。')
     scratch, cleaned = prepare_openlist_scratch(PRIVATE)
     server_config = read_json(DATA/'config.json')
     server_config['temp_dir'] = str(scratch)
     write_json(DATA/'config.json', server_config)
-    write_json(ROOT/'runtime/temp-cleanup.json', dict(**cleaned, at=time.time()))
+    write_snapshot(ROOT/'runtime/temp-cleanup.json', dict(**cleaned, at=time.time()))
     out = open(ROOT / 'logs/openlist-process.log','ab')
     subprocess.Popen([str(OPENLIST),'server','--data',str(DATA)], cwd=ROOT,
         stdout=out, stderr=out, creationflags=NO_WINDOW,
@@ -155,7 +176,7 @@ def _ensure_server():
             login()
             return
         except Exception: time.sleep(.5)
-    raise RuntimeError('OpenList failed to start; see logs/openlist-process.log')
+    raise TransientSyncError('OpenList failed to start; see logs/openlist-process.log')
 
 def ensure_webdav_permissions(token):
     """Apply the user-approved single permission bit on this private instance."""
@@ -309,17 +330,31 @@ def native_115_request(cookie,path,query):
     return result
 
 def native_115_list(cookie,cid):
-    rows=[];offset=0
+    rows=[];offset=0;expected=None;seen=set()
     while True:
         response=native_115_request(cookie,'files',dict(aid=1,cid=str(cid),o='file_name',asc=1,
             offset=offset,show_dir=1,limit=1150,format='json',snap=0,natsort=0,record_open_time=0,fc_mix=0))
         if str(response.get('cid'))!=str(cid):
-            raise RuntimeError('115 返回了不同目录，已停止同步')
-        page=response.get('data') or []
+            raise IndexInvalidError('115 返回了不同目录，已停止同步')
+        count=int(response['count'])
+        if count<0 or (expected is not None and count!=expected):
+            raise ScanChangedError('115 目录在分页期间变化，等待重新检查')
+        expected=count
+        page=response.get('data')
+        if not isinstance(page,list) or int(response.get('offset',offset))!=offset:
+            raise IndexInvalidError('115 目录分页无效，已停止同步')
+        for item in page:
+            if not isinstance(item,dict) or not isinstance(item.get('n'),str):
+                raise IndexInvalidError('115 目录条目无效，已停止同步')
+            key=('f',str(item['fid'])) if item.get('fid') else ('d',str(item['cid'])) if item.get('cid') else None
+            if key is not None:
+                if key in seen: raise IndexInvalidError('115 目录分页重复，已停止同步')
+                seen.add(key)
         rows.extend(page)
         offset+=len(page)
-        if offset>=int(response['count']): return rows
-        if not page: raise RuntimeError('115 目录分页不完整，已停止同步')
+        if offset>count: raise IndexInvalidError('115 目录计数不一致，已停止同步')
+        if offset==count: return rows
+        if not page: raise IndexInvalidError('115 目录分页不完整，已停止同步')
 
 def native_115_check_names(cookie,suffix,progress=None):
     lookup=native_115_request(cookie,'files/getid',dict(path=suffix))
@@ -557,9 +592,13 @@ def wait_for_retry(error, failures):
     delay=min(300,30*2**min(max(failures-1,0),4))
     deadline=time.monotonic()+delay
     retry_at=dt.datetime.now().astimezone()+dt.timedelta(seconds=delay)
-    status('retrying',str(error),error_category=recovery_policy(error).category,retry_seconds=delay,
-           retry_at=retry_at.isoformat(),retry_attempt=failures)
+    reported=False
+    next_report=0
     while True:
+        if not reported and time.monotonic()>=next_report:
+            reported=wait_status('retrying',str(error),error_category=recovery_policy(error).category,
+                retry_seconds=delay,retry_at=retry_at.isoformat(),retry_attempt=failures)
+            next_report=time.monotonic()+5
         if ((ROOT/'runtime/stop').exists() or (ROOT/'runtime/sync-now').exists()
                 or folder_guard().exists()):
             return
@@ -570,10 +609,12 @@ def wait_for_retry(error, failures):
 
 
 def wait_for_action(error):
-    status('error',str(error),error_category=recovery_policy(error).category,requires_action=True)
+    reported=wait_status('error',str(error),error_category=recovery_policy(error).category,requires_action=True)
     while not ((ROOT/'runtime/stop').exists() or (ROOT/'runtime/sync-now').exists()
                or folder_guard().exists()):
         time.sleep(1)
+        if not reported:
+            reported=wait_status('error',str(error),error_category=recovery_policy(error).category,requires_action=True)
 
 
 def worker_loop():
@@ -596,7 +637,7 @@ def worker_loop():
     pause_reported=False
     force_scan=True
     def watch_metrics(data):
-        write_json(ROOT/'runtime/local-watch.json',dict(data,pid=os.getpid(),
+        write_snapshot(ROOT/'runtime/local-watch.json',dict(data,pid=os.getpid(),
             updated_at=dt.datetime.now().astimezone().isoformat()))
     monitor=LocalChangeMonitor(Path(cfg['local_path']),snapshot,
         full_scan_seconds=cfg.get('local_full_scan_seconds',60),
@@ -608,8 +649,7 @@ def worker_loop():
                 return  # Re-read config and snapshots after a completed/rolled-back move.
             if (ROOT/'runtime/stop').exists():
                 if not pause_reported:
-                    status('paused','同步已暂停，可以安全检查文件。')
-                    pause_reported=True
+                    pause_reported=wait_status('paused','同步已暂停，可以安全检查文件。')
                 time.sleep(1)
                 continue
             if pause_reported:
@@ -654,7 +694,7 @@ def worker_loop():
                 time.sleep(cfg['local_scan_seconds'])
             except SyncPaused:
                 force_scan=True
-                status('paused','同步已暂停，可以安全检查文件。')
+                wait_status('paused','同步已暂停，可以安全检查文件。')
                 failures=0
             except Exception as error:
                 force_scan=True

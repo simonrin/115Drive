@@ -6,20 +6,25 @@ using System.Drawing.Imaging;
 using System.IO;
 
 namespace TwoDrive {
- // Shared curve-based mark for the tray, windows, installer and multi-size ICO.
+ // Vector cloud silhouette, with optical simplification for notification-area sizes.
  public static class CloudBrand {
+  public const string Indigo="#375F83",Paper="#FFFFFF";
   static Color Hex(string value) { return ColorTranslator.FromHtml(value); }
-  static GraphicsPath Cloud() {
+  static GraphicsPath Cloud(bool compact) {
    var p=new GraphicsPath();
-   // One unbroken line: unwind the main scroll, sweep the low cloud contour,
-   // then finish in the smaller return. No branches, internal lines or tail.
-   p.AddBezier(31,30,34,30,35,27,32,25);p.AddBezier(32,25,28,22,24,25,25,29);
-   p.AddBezier(25,29,26,36,35,36,39,32);p.AddBezier(39,32,43,28,41,20,35,18);
-   p.AddBezier(35,18,28,15,22,19,21,24);p.AddBezier(21,24,16,21,10,24,11,29);
-   p.AddBezier(11,29,6,30,5,35,8,39);p.AddBezier(8,39,13,45,22,41,30,41);
-   p.AddBezier(30,41,39,40,47,44,55,39);p.AddBezier(55,39,61,35,58,28,53,28);
-   p.AddBezier(53,28,49,27,46,30,48,33);p.AddBezier(48,33,49,36,53,35,53,32);
-   return p;
+   p.AddBezier(12,49,1,49,-1,32,9,28);
+   p.AddBezier(9,28,5,16,15,11,23,16);
+   p.AddBezier(23,16,26,2,48,3,48,24);
+   if(compact) {
+    p.AddBezier(48,24,61,22,65,40,54,46);
+    p.AddBezier(54,46,47,52,42,52,35,48);
+   } else {
+    p.AddBezier(48,24,57,22,52,38,62,31);
+    p.AddBezier(62,31,61,42,53,44,48,43);
+    p.AddBezier(48,43,46,53,39,55,33,49);
+   }
+   p.AddBezier(compact?35:33,48,25,58,17,55,12,49);
+   p.CloseFigure();return p;
   }
   static Pen Stroke(Color color,float width) {
    return new Pen(color,width){StartCap=LineCap.Round,EndCap=LineCap.Round,LineJoin=LineJoin.Round};
@@ -30,36 +35,28 @@ namespace TwoDrive {
    using(var g=Graphics.FromImage(bitmap)) {
     g.SmoothingMode=SmoothingMode.AntiAlias;g.PixelOffsetMode=PixelOffsetMode.HighQuality;
     g.ScaleTransform(size/64f,size/64f);
-    bool paused=mode=="paused",error=mode=="error";
-    // Clear blue on a transparent background, with no tile or gradient.
-    Color ink=Hex(paused?"#8B96A6":"#176BEB");
-    // Slightly heavier small-size strokes survive the Windows notification area.
-    float width=size<=16?5.4f:size<=20?5f:size<=32?4.7f:4.5f;
-    using(var path=Cloud())using(var pen=Stroke(ink,width)) {
-     if(mode!="app") {
-      // Optical sizing for the notification area: use the icon slot rather
-      // than the padded app canvas. Keep the stroke round and unscaled.
-      RectangleF bounds;
-      using(var outline=(GraphicsPath)path.Clone()) {
-       outline.Flatten(null,.01f);bounds=outline.GetBounds();
-      }
-      float sx=(60-width)/bounds.Width,sy=(40-width)/bounds.Height;
-      using(var fit=new Matrix(sx,0,0,sy,2+width/2-bounds.X*sx,10+width/2-bounds.Y*sy))path.Transform(fit);
-     }
-     g.DrawPath(pen,path);
+    bool compact=size<=32,paused=mode=="paused",error=mode=="error";
+    using(var cloud=Cloud(compact))using(var fill=new SolidBrush(Hex("#376F9D")))using(var rim=Stroke(Hex("#ECF3FA"),compact?2.5f:1.5f)) {
+     g.FillPath(fill,cloud);g.DrawPath(rim,cloud);
+    }
+    // One open curl at larger sizes; solid lobes remain legible at 16-32 px.
+    if(!compact)using(var curl=new GraphicsPath())using(var pen=Stroke(Color.White,3.5f)) {
+     curl.AddBezier(18,38,8,32,16,22,24,27);
+     curl.AddBezier(24,27,27,17,39,19,41,30);
+     curl.AddBezier(41,30,45,46,25,49,24,37);
+     curl.AddBezier(24,37,23,30,32,29,33,35);
+     g.DrawPath(pen,curl);
     }
     if(mode!="app") {
-     var badgeState=g.Save();
-     g.TranslateTransform(6,6);g.ScaleTransform(.9f,.9f);
-     using(var rim=new SolidBrush(Hex("#FCFDFE")))g.FillEllipse(rim,42,42,21,21);
-     using(var badge=new SolidBrush(Hex(paused?"#97703D":error?"#A83F36":mode=="idle"?"#2D815C":"#176BEB")))g.FillEllipse(badge,44,44,17,17);
-     using(var pen=Stroke(Color.White,2.2f)) {
-      if(mode=="idle")g.DrawLines(pen,new[]{new PointF(48,52),new PointF(51,55),new PointF(57,49)});
-      else if(paused){g.DrawLine(pen,50,49,50,56);g.DrawLine(pen,55,49,55,56);}
-      else if(error){g.DrawLine(pen,52.5f,48,52.5f,53);g.DrawLine(pen,52.5f,56,52.5f,56.2f);}
-      else {g.DrawArc(pen,48,48,9,9,30,280);g.DrawLines(pen,new[]{new PointF(55,47),new PointF(57,50),new PointF(53,50)});}
+     // Seven pixels wide even at 16 px, with shape as well as colour encoding.
+     using(var rim=new SolidBrush(Color.White))g.FillEllipse(rim,34,33,30,30);
+     using(var badge=new SolidBrush(Hex(error?"#B84141":paused?"#667385":mode=="idle"?"#247A55":"#375F83")))g.FillEllipse(badge,37,36,24,24);
+     using(var pen=Stroke(Color.White,compact?4:3.2f)) {
+      if(mode=="idle")g.DrawLines(pen,new[]{new PointF(42,48),new PointF(47,53),new PointF(55,43)});
+      else if(paused){g.DrawLine(pen,45,42,45,54);g.DrawLine(pen,53,42,53,54);}
+      else if(error){g.DrawLine(pen,49,41,49,48);g.DrawLine(pen,49,54,49,54.2f);}
+      else {g.DrawArc(pen,42,41,14,14,45,280);g.DrawLines(pen,new[]{new PointF(51,40),new PointF(56,43),new PointF(52,47)});}
      }
-     g.Restore(badgeState);
     }
    }
    return bitmap;
@@ -80,8 +77,8 @@ namespace TwoDrive {
     foreach(var bytes in images)writer.Write(bytes);writer.Flush();return output.ToArray();
    }
   }
-  public static Icon CreateIcon(string mode) {
-   using(var input=new MemoryStream(IconBytes(mode)))using(var icon=new Icon(input,32,32))return (Icon)icon.Clone();
+  public static Icon CreateIcon(string mode,int size) {
+   using(var input=new MemoryStream(IconBytes(mode)))using(var icon=new Icon(input,size,size))return (Icon)icon.Clone();
   }
   public static void WriteIcon(string path) { File.WriteAllBytes(path,IconBytes("app")); }
  }

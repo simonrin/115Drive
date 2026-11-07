@@ -9,6 +9,7 @@ import threading
 import time
 
 from local_paths import configure_mapping
+from runtime_json import atomic_write_bytes, write_snapshot
 
 
 class Cancelled(RuntimeError):
@@ -16,10 +17,7 @@ class Cancelled(RuntimeError):
 
 
 def atomic_bytes(path, data):
-    path = Path(path)
-    temporary = path.with_name(path.name + '.' + secrets.token_hex(4) + '.tmp')
-    temporary.write_bytes(data)
-    os.replace(temporary, path)
+    atomic_write_bytes(path, data, durable=True)
 
 
 def ordinary_path(host, path):
@@ -63,7 +61,7 @@ class FolderChanger:
             return dict(state='idle', message='尚未更改同步文件夹')
 
     def publish(self, state, message, **extra):
-        self.t.write_json(self.t.ROOT / 'runtime/folder-change.json', dict(state=state, message=message, **extra))
+        write_snapshot(self.t.ROOT / 'runtime/folder-change.json', dict(state=state, message=message, **extra))
 
     def checked(self, target):
         cfg = self.t.read_json(self.t.CONFIG)

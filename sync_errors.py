@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import errno
 import http.client
 import urllib.error
+from runtime_json import AtomicReplaceBusyError
 
 
 class ActionRequiredError(RuntimeError):
@@ -35,9 +36,14 @@ def recovery_policy(error):
         return RecoveryPolicy('index_invalid', True, True)
     if isinstance(error, ScanChangedError):
         return RecoveryPolicy('cloud_changing', True)
+    if isinstance(error, AtomicReplaceBusyError):
+        return RecoveryPolicy('runtime_file_busy', True)
     if isinstance(error, urllib.error.HTTPError):
         return RecoveryPolicy('authorization' if error.code in (401, 403) else 'remote_http',
                               error.code in (408, 425, 429) or error.code >= 500)
+    # Winsock WSAEACCES is a connection failure, not a local file ACL failure.
+    if isinstance(error, OSError) and getattr(error, 'winerror', None) == 10013:
+        return RecoveryPolicy('network_or_io', True)
     if isinstance(error, (PermissionError, FileNotFoundError)):
         return RecoveryPolicy('local_access', False)
     if isinstance(error, OSError) and error.errno in (errno.ENOSPC, errno.EROFS, errno.EACCES, errno.ENAMETOOLONG):

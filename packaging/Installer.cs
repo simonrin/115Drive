@@ -13,12 +13,12 @@ class Installer : Form {
  readonly ProgressBar progress=new ProgressBar{Width=480,Height=10};
  readonly string destination=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"115Drive");
  Installer() {
-  Text="安装 115Drive";ClientSize=new Size(536,300);StartPosition=FormStartPosition.CenterScreen;FormBorderStyle=FormBorderStyle.FixedDialog;MaximizeBox=false;Font=new Font("Microsoft YaHei UI",10);BackColor=ColorTranslator.FromHtml("#FCFDFE");ForeColor=ColorTranslator.FromHtml("#26364D");
-  Icon=TwoDrive.CloudBrand.CreateIcon("app");
+  Text="安装 115Drive";ClientSize=new Size(536,300);StartPosition=FormStartPosition.CenterScreen;FormBorderStyle=FormBorderStyle.FixedDialog;MaximizeBox=false;Font=new Font("Microsoft YaHei UI",10);BackColor=ColorTranslator.FromHtml("#F7F8FA");ForeColor=ColorTranslator.FromHtml("#243247");
+  Icon=TwoDrive.CloudBrand.CreateIcon("app",32);
   var mark=new PictureBox{Image=TwoDrive.CloudBrand.Render(128,"app"),Location=new Point(28,22),Size=new Size(54,54),SizeMode=PictureBoxSizeMode.Zoom};
   FormClosed+=(s,e)=>{mark.Image.Dispose();Icon.Dispose();};
-  install.FlatStyle=FlatStyle.Flat;install.FlatAppearance.BorderSize=0;install.BackColor=ColorTranslator.FromHtml("#176BEB");install.ForeColor=Color.White;
-  var title=new Label{Text="115Drive",Font=new Font("Microsoft YaHei UI",23,FontStyle.Bold),AutoSize=true,Location=new Point(96,27)};
+  install.FlatStyle=FlatStyle.Flat;install.FlatAppearance.BorderSize=0;install.BackColor=ColorTranslator.FromHtml(TwoDrive.CloudBrand.Indigo);install.ForeColor=Color.White;
+  var title=new Label{Text="115Drive",ForeColor=ColorTranslator.FromHtml(TwoDrive.CloudBrand.Indigo),Font=new Font("Microsoft YaHei UI",23,FontStyle.Bold),AutoSize=true,Location=new Point(96,27)};
   var description=new Label{Text="115 网盘双向同步 · 原生托盘与设置\n自带运行组件，无需另外安装 Python。",AutoSize=true,Location=new Point(30,85)};
   status.Location=new Point(30,145);status.Text="安装到当前用户目录：\n"+destination;
   progress.Location=new Point(30,213);install.Location=new Point(375,244);

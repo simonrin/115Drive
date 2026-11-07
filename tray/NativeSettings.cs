@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
@@ -87,7 +87,11 @@ namespace TwoDrive {
   void SettingsPage(string page) {
    foreach(string name in new[]{"Sync","Account","About"}) {
     SF<StackPanel>(name+"Page").Visibility=name==page?Visibility.Visible:Visibility.Collapsed;
-    SF<Button>(name+"Nav").Background=Brush(name==page?"#E2EBFA":"#F4F6FA");
+    var navigation=SF<Button>(name+"Nav");
+    navigation.Background=Brush(name==page?"#E8EFF6":"#F7F8FA");
+    navigation.Foreground=Brush(name==page?CloudBrand.Indigo:"#243247");
+    navigation.BorderBrush=name==page?Brush("#375F83"):Brushes.Transparent;
+    navigation.FontWeight=name==page?FontWeights.SemiBold:FontWeights.Normal;
    }
    SF<TextBlock>("SettingsTitle").Text=page=="Sync"?"同步与备份":page=="Account"?"账户":"关于";
    SF<TextBlock>("SettingsSubtitle").Text=page=="Sync"?"管理这台电脑上的文件与同步偏好":page=="Account"?"连接你的 115 网盘":"115Drive · 自动双向同步";
@@ -216,8 +220,8 @@ namespace TwoDrive {
    SF<Button>("CheckFolderButton").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
    if(lastCommand!="folder/preview"||!SF<Button>("ApplyFolderButton").IsEnabled)throw new Exception("Native folder preview wiring failed");
    SF<Button>("ApplyFolderButton").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));if(lastCommand!="folder/change")throw new Exception("Folder apply wiring failed");passed.Add("native_folder_preview_and_apply");
-   SF<Button>("AccountNav").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));if(SF<StackPanel>("AccountPage").Visibility!=Visibility.Visible)throw new Exception("Account navigation failed");passed.Add("native_account_page");
-   SF<Button>("AboutNav").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));if(SF<StackPanel>("AboutPage").Visibility!=Visibility.Visible)throw new Exception("About navigation failed");passed.Add("native_about_page");
+   SF<Button>("AccountNav").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));if(SF<StackPanel>("AccountPage").Visibility!=Visibility.Visible)throw new Exception("Account navigation failed");passed.Add("native_account_page");CaptureSettings("settings-preview-account.png");
+   SF<Button>("AboutNav").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));if(SF<StackPanel>("AboutPage").Visibility!=Visibility.Visible)throw new Exception("About navigation failed");passed.Add("native_about_page");CaptureSettings("settings-preview-about.png");
    SettingsPage("Sync");SF<StackPanel>("FolderEditor").Visibility=Visibility.Collapsed;CaptureSettings("settings-preview.png");settings.Close();
   }
  }

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
@@ -99,7 +99,7 @@ namespace TwoDrive {
    foreach(string mode in new[]{"idle","sync","paused","error"})icons[mode]=CreateIcon(mode);
    notify.Icon=icons["idle"];notify.Text="115Drive · 正在读取状态";notify.Visible=!test;
    notify.MouseClick+=(s,e)=>{if(e.Button==Forms.MouseButtons.Left)TogglePanel();};
-   var menu=new Forms.ContextMenuStrip{BackColor=Drawing.Color.FromArgb(252,253,254),ForeColor=Drawing.Color.FromArgb(38,54,77)};
+   var menu=new Forms.ContextMenuStrip{BackColor=Drawing.ColorTranslator.FromHtml("#FFFFFF"),ForeColor=Drawing.ColorTranslator.FromHtml("#243247")};
    menu.Items.Add("查看同步进度",null,(s,e)=>ShowPanel(false));
    menu.Items.Add("立即同步",null,(s,e)=>Send("sync-now"));
    menu.Items.Add("打开同步文件夹",null,(s,e)=>LaunchFolder());
@@ -142,7 +142,7 @@ namespace TwoDrive {
 
   void Render(Dictionary<string,object> model,Dictionary<string,object> progress,object recent) {
    state=model;
-   string mode=Text(model,"state"), title="正在读取同步状态", detail=Text(model,"message"), color="#EFF5FF", ink="#285793", symbol="↻", icon="sync";
+   string mode=Text(model,"state"), title="正在读取同步状态", detail=Text(model,"message"), color="#FFFBE5", ink=CloudBrand.Indigo, symbol="↻", icon="sync";
    bool active=mode=="syncing" || mode=="checking" || mode=="stopping";
    bool retrying=Retrying(model);
    bool problem=mode=="error" || retrying;
@@ -188,7 +188,7 @@ namespace TwoDrive {
     detail=String.IsNullOrEmpty(path)?"正在核对本地与网盘目录。":path;
    }
    Label("StatusTitle").Text=title;Label("StatusSymbol").Text=symbol;
-   Label("StatusSymbol").Foreground=Brush(ink);Label("StatusTitle").Foreground=Brush(ink);
+   Label("StatusSymbol").Foreground=Brush(ink);Label("StatusTitle").Foreground=Brush("#243247");
    Find<Border>("StatusCard").Background=problem?Brush(color):Brushes.Transparent;
    Label("StatusTitle").ToolTip=new TextBlock{Text=title+"\n"+detail,TextWrapping=TextWrapping.Wrap,MaxWidth=360};
    bool spin=active && !problem && symbol=="↻" && SystemParameters.ClientAreaAnimation;
@@ -207,7 +207,8 @@ namespace TwoDrive {
     "\n文件传输："+(String.IsNullOrEmpty(transferredAt)?"尚无记录":TimeLabel(transferredAt));
    bool paused=(!retrying && (mode=="paused" || (mode=="error" && !Object.Equals(Value(model,"requires_action"),true)))) || !WorkerExists();
    Label("PauseLabel").Text=paused?"恢复同步":"暂停同步";
-   Label("PauseGlyph").Text=paused?"\uE768":"\uE769";
+   Find<System.Windows.Shapes.Path>("PauseGlyph").Data=Geometry.Parse(paused?"M 6 3 L 18 11 L 6 19 Z":"M 7 4 L 7 18 M 15 4 L 15 18");
+   System.Windows.Automation.AutomationProperties.SetName(Find<Button>("PauseButton"),Label("PauseLabel").Text);
    Find<Button>("PauseButton").IsEnabled=!sending && mode!="stopping" && mode!="relocating";
    Find<Button>("SyncButton").IsEnabled=!sending && mode!="relocating" && mode!="stopping";
    var visible=Rows(recent).Reverse().Where(row=>Text(row,"action")!="backup").Take(20).ToList();
@@ -226,15 +227,15 @@ namespace TwoDrive {
     grid.ColumnDefinitions.Add(new ColumnDefinition{Width=new GridLength(46)});grid.ColumnDefinitions.Add(new ColumnDefinition());
     var badge=new Border{Width=34,Height=44,VerticalAlignment=VerticalAlignment.Center,HorizontalAlignment=HorizontalAlignment.Left};
     var icon=ActivityIcon(Text(item,"name"));
-    badge.Child=icon!=null?(UIElement)new Image{Source=icon,Width=32,Height=32,Stretch=Stretch.Uniform}:new TextBlock{Text="\uE8A5",FontFamily=new FontFamily("Segoe MDL2 Assets"),FontSize=27,Foreground=Brush("#8390A1"),VerticalAlignment=VerticalAlignment.Center};
+    badge.Child=icon!=null?(UIElement)new Image{Source=icon,Width=32,Height=32,Stretch=Stretch.Uniform}:new TextBlock{Text="\uE8A5",FontFamily=new FontFamily("Segoe MDL2 Assets"),FontSize=27,Foreground=Brush(CloudBrand.Indigo),VerticalAlignment=VerticalAlignment.Center};
     grid.Children.Add(badge);
     var stack=new StackPanel();Grid.SetColumn(stack,1);
-    stack.Children.Add(new TextBlock{Text=FileLabel(Text(item,"name")),ToolTip=Text(item,"name"),Foreground=Brush("#26364D"),FontSize=12,TextTrimming=TextTrimming.CharacterEllipsis});
-    var destination=new TextBlock{Foreground=Brush("#657083"),FontSize=11,Margin=new Thickness(0,3,0,0),TextTrimming=TextTrimming.CharacterEllipsis};
+    stack.Children.Add(new TextBlock{Text=FileLabel(Text(item,"name")),ToolTip=Text(item,"name"),Foreground=Brush("#243247"),FontSize=12,TextTrimming=TextTrimming.CharacterEllipsis});
+    var destination=new TextBlock{Foreground=Brush("#596779"),FontSize=11,Margin=new Thickness(0,3,0,0),TextTrimming=TextTrimming.CharacterEllipsis};
     destination.Inlines.Add(new Run(description.Status));
-    if(!String.IsNullOrEmpty(description.Folder))destination.Inlines.Add(new Run(" "+description.Folder){Foreground=Brush("#2868C9")});
+    if(!String.IsNullOrEmpty(description.Folder))destination.Inlines.Add(new Run(" "+description.Folder){Foreground=Brush(CloudBrand.Indigo)});
     stack.Children.Add(destination);
-    stack.Children.Add(new TextBlock{Text=ActivityTime(Text(item,"time")),Foreground=Brush("#8390A1"),FontSize=10,Margin=new Thickness(0,2,0,0)});
+    stack.Children.Add(new TextBlock{Text=ActivityTime(Text(item,"time")),Foreground=Brush("#667385"),FontSize=10,Margin=new Thickness(0,2,0,0)});
     grid.Children.Add(stack);
     var button=new Button{Content=grid,Padding=new Thickness(12,10,12,10),HorizontalContentAlignment=HorizontalAlignment.Stretch,
      ToolTip=Text(item,"name")+"\n单击打开当前文件 · 右键打开所在文件夹"};
@@ -248,7 +249,7 @@ namespace TwoDrive {
     menu.Closed+=(s,e)=>{if(activityMenu==menu)activityMenu=null;if(!test && !activityDialogOpen && !panel.IsActive){hiddenAt=DateTime.UtcNow;panel.Hide();}};
     button.ContextMenu=menu;list.Children.Add(button);
    }
-   if(list.Children.Count==0)list.Children.Add(new TextBlock{Text="暂无同步记录\n添加或修改文件后，活动会显示在这里。",Foreground=Brush("#97A2B0"),FontSize=12,Margin=new Thickness(13,24,13,12),TextWrapping=TextWrapping.Wrap,LineHeight=24});
+   if(list.Children.Count==0)list.Children.Add(new TextBlock{Text="暂无同步记录\n添加或修改文件后，活动会显示在这里。",Foreground=Brush("#596779"),FontSize=12,Margin=new Thickness(13,24,13,12),TextWrapping=TextWrapping.Wrap,LineHeight=24});
   }
 
   void TogglePanel() {
@@ -313,7 +314,7 @@ namespace TwoDrive {
   void LaunchFolder() {Launch(Text(Read("config.json"),"local_path",Path.Combine(root,"..")));}
   void Launch(string target) {if(test){lastCommand="open";return;}try{Process.Start(new ProcessStartInfo(target){UseShellExecute=true});}catch(Exception error){Log(error);}}
   void Log(Exception error) {try{string path=Path.Combine(root,"logs/tray.log");if(File.Exists(path)&&new FileInfo(path).Length>1000000)File.Delete(path);File.AppendAllText(path,DateTime.Now.ToString("s")+" "+error.GetType().Name+": "+error.Message+Environment.NewLine,Encoding.UTF8);}catch{}}
-  Drawing.Icon CreateIcon(string mode) {return CloudBrand.CreateIcon(mode);}
+  Drawing.Icon CreateIcon(string mode) {return CloudBrand.CreateIcon(mode,Forms.SystemInformation.SmallIconSize.Width);}
   static BitmapSource BrandImage() {
    using(var bitmap=CloudBrand.Render(136,"app"))using(var data=new MemoryStream()) {
     bitmap.Save(data,Drawing.Imaging.ImageFormat.Png);data.Position=0;

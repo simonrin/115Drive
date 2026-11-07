@@ -11,6 +11,7 @@ import json
 import time
 from pathlib import PurePosixPath
 from sync_errors import ActionRequiredError, IndexInvalidError, ScanChangedError, recovery_policy
+from runtime_json import write_snapshot
 
 
 def valid_names(rows):
@@ -390,7 +391,7 @@ class CloudScan:
                           changed=changed, checked_at=self.index['checked_at'],
                           index_written=index_written, index_bytes=self.path.stat().st_size,
                           receipt_bytes=self.receipt_path.stat().st_size)
-            self.t.write_json(self.t.ROOT/'runtime/scan-metrics.json', report)
+            write_snapshot(self.t.ROOT/'runtime/scan-metrics.json', report)
             return changed
         except self.t.SyncPaused:
             raise
@@ -419,7 +420,7 @@ class CloudScan:
             self.pending.add(cid)
         self.audit_cursor += 1
         self.last_audit = time.time()
-        self.t.write_json(self.t.ROOT/'runtime/scan-audit.json',dict(
+        write_snapshot(self.t.ROOT/'runtime/scan-audit.json',dict(
             checked_at=self.last_audit, directories=len(ids),
             cursor=self.audit_cursor, pending_change=bool(self.pending)))
         return bool(self.pending)
