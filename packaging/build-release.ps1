@@ -1,4 +1,4 @@
-param([string]$Python='python.exe',[string]$DependencyRoot,[string]$OutputDirectory,[ValidatePattern('^[0-9]+\.[0-9]+\.[0-9]+(?:-[a-z0-9.]+)?$')][string]$Version='0.3.0-rc1')
+param([string]$Python='python.exe',[string]$DependencyRoot,[string]$OutputDirectory,[ValidatePattern('^[0-9]+\.[0-9]+\.[0-9]+(?:-[a-z0-9.]+)?$')][string]$Version='0.3.0-rc2')
 $ErrorActionPreference='Stop'
 $root=Split-Path $PSScriptRoot
 if (-not $DependencyRoot) { $DependencyRoot=$root }
@@ -16,19 +16,21 @@ if ($LASTEXITCODE) { throw 'Native UI compilation failed' }
 Copy-Item -LiteralPath (Join-Path $build 'tray\TwoDriveTray.exe') -Destination (Join-Path $stage '115Drive.exe')
 foreach ($directory in @('tray','bin\openlist-v4.2.6','bin\rclone-v1.75.1\rclone-v1.75.1-windows-amd64','licenses','third_party')) { New-Item -ItemType Directory -Path (Join-Path $stage $directory) -Force | Out-Null }
 foreach ($file in @('Panel.xaml','Settings.xaml','keep-local.ico','free-space.ico')) { Copy-Item -LiteralPath (Join-Path $root ('tray\'+$file)) -Destination (Join-Path $stage 'tray') }
-foreach ($file in @('filters.txt','install-startup.ps1','install-tray.ps1','set-startup.ps1','register-sync-root.ps1','register-shell-menu.ps1','LICENSE','README.md','PRIVACY.md','CONTRIBUTING.md','THIRD_PARTY_NOTICES.md')) { Copy-Item -LiteralPath (Join-Path $root $file) -Destination $stage }
+foreach ($file in @('filters.txt','install-startup.ps1','install-tray.ps1','set-startup.ps1','register-sync-root.ps1','register-shell-menu.ps1','installer-process.ps1','LICENSE','README.md','PRIVACY.md','CONTRIBUTING.md','THIRD_PARTY_NOTICES.md')) { Copy-Item -LiteralPath (Join-Path $root $file) -Destination $stage }
 Copy-Item -LiteralPath (Join-Path $root 'docs') -Destination (Join-Path $stage 'docs') -Recurse
 Copy-Item -LiteralPath (Join-Path $DependencyRoot 'bin\openlist-v4.2.6\openlist.exe') -Destination (Join-Path $stage 'bin\openlist-v4.2.6')
 Copy-Item -LiteralPath (Join-Path $DependencyRoot 'bin\rclone-v1.75.1\rclone-v1.75.1-windows-amd64\rclone.exe') -Destination (Join-Path $stage 'bin\rclone-v1.75.1\rclone-v1.75.1-windows-amd64')
 Copy-Item -Path (Join-Path $root 'licenses\*') -Destination (Join-Path $stage 'licenses')
 Copy-Item -Path (Join-Path $root 'third_party\*.zip') -Destination (Join-Path $stage 'third_party')
 Copy-Item -LiteralPath (Join-Path $root 'third_party\build-openlist.ps1') -Destination (Join-Path $stage 'third_party')
+& $Python (Join-Path $PSScriptRoot 'make-install-manifest.py') $stage --version $Version
+if ($LASTEXITCODE) { throw 'Installer inventory generation failed' }
 & $Python (Join-Path $PSScriptRoot 'verify-package.py') $stage
 if ($LASTEXITCODE) { throw 'Package privacy/structure verification failed' }
 & $Python (Join-Path $PSScriptRoot 'zip-package.py') $stage (Join-Path $output ('115Drive-'+$Version+'-windows-x64.zip'))
 if ($LASTEXITCODE) { throw 'Package archive failed' }
 $framework=Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319'
-& (Join-Path $framework 'csc.exe') /nologo /utf8output /codepage:65001 /target:winexe /platform:x64 /optimize+ ('/out:'+(Join-Path $output ('115Drive-Setup-'+$Version+'-x64.exe'))) ('/win32icon:'+(Join-Path $root 'tray\115Drive.ico')) ('/resource:'+(Join-Path $output ('115Drive-'+$Version+'-windows-x64.zip'))+',payload.zip') /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll /reference:System.IO.Compression.dll (Join-Path $PSScriptRoot 'Installer.cs') (Join-Path $root 'tray\CloudBrand.cs')
+& (Join-Path $framework 'csc.exe') /nologo /utf8output /codepage:65001 /target:winexe /platform:x64 /optimize+ ('/out:'+(Join-Path $output ('115Drive-Setup-'+$Version+'-x64.exe'))) ('/win32icon:'+(Join-Path $root 'tray\115Drive.ico')) ('/resource:'+(Join-Path $output ('115Drive-'+$Version+'-windows-x64.zip'))+',payload.zip') /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll /reference:System.Web.Extensions.dll /reference:System.IO.Compression.dll (Join-Path $PSScriptRoot 'Installer.cs') (Join-Path $root 'tray\CloudBrand.cs')
 if ($LASTEXITCODE) { throw 'Installer compilation failed' }
 Get-ChildItem -LiteralPath $output -File | Where-Object Name -ne 'SHA256SUMS.txt' | Get-FileHash -Algorithm SHA256 | ForEach-Object { $_.Hash.ToLower()+'  '+[System.IO.Path]::GetFileName($_.Path) } | Set-Content -LiteralPath (Join-Path $output 'SHA256SUMS.txt') -Encoding ASCII
 Get-ChildItem -LiteralPath $output -File | Select-Object Name,Length

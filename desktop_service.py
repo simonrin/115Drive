@@ -18,10 +18,19 @@ def defaults(root):
 
 def main():
     parser=argparse.ArgumentParser()
-    parser.add_argument('action',choices=['server','worker','diagnose'])
+    parser.add_argument('action',choices=['server','worker','diagnose','upgrade'])
     parser.add_argument('--root',required=True)
+    parser.add_argument('--payload')
     args=parser.parse_args()
     root=Path(args.root).resolve()
+    if args.action=='upgrade':
+        if not args.payload: parser.error('--payload is required for upgrade')
+        from installer_upgrade import main as upgrade
+        try: result=upgrade(root,Path(args.payload))
+        except Exception as error: result=dict(ok=False,error=str(error))
+        (Path(args.payload)/'upgrade-result.json').write_text(json.dumps(result,ensure_ascii=False),encoding='utf-8')
+        return 0 if result['ok'] else 1
+    if (root/'runtime/private/installer-active.json').exists(): return 2
     os.environ['TWODRIVE_HOME']=str(root)
     import twodrive as t
     if args.action=='diagnose':

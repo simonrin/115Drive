@@ -429,6 +429,10 @@ namespace TwoDrive {
    string root=File.Exists(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"tray/Panel.xaml"))?AppDomain.CurrentDomain.BaseDirectory:Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"../.."));
    int index=Array.IndexOf(args,"--root");if(index>=0&&index+1<args.Length)root=Path.GetFullPath(args[index+1]);
    root=Path.GetFullPath(root);if(root.Length>Path.GetPathRoot(root).Length)root=root.TrimEnd('\\','/');
+   if(File.Exists(Path.Combine(root,"runtime/private/installer-active.json"))) {
+    if(args.Contains("--settings") || args.Contains("--show"))Forms.MessageBox.Show("程序正在升级或等待恢复。请重新运行安装包完成升级。","115Drive",Forms.MessageBoxButtons.OK,Forms.MessageBoxIcon.Information);
+    return 2;
+   }
    if(args.Contains("--file-policy"))return ApplyShellPolicy(root,args);
    Directory.CreateDirectory(Path.Combine(root,"runtime"));Directory.CreateDirectory(Path.Combine(root,"logs"));
    bool test=args.Contains("--self-test"),show=args.Contains("--show"),showSettings=args.Contains("--settings");

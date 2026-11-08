@@ -190,6 +190,7 @@ class Handler(BaseHTTPRequestHandler):
             except FileNotFoundError: result=dict(message='等待 115 授权',updated_at='尚未连接')
             result['initialized']=(t.PRIVATE/'initialized.json').exists()
             result['authorization_allowed']=authorization_allowed()
+            result['maintenance_busy']=BUSY.locked()
             result['local_path']=t.read_json(t.CONFIG)['local_path']
             result['folder_change']=FOLDERS.view()
             result['folder_changing']=FOLDERS.guard.exists() or (BUSY.locked() and result['folder_change'].get('state')=='running')
@@ -203,6 +204,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(403,'Invalid request')
         if self.headers.get('Origin') not in ('http://127.0.0.1:5245','http://localhost:5245',None):
             return self.send(403,'Invalid origin')
+        if (t.PRIVATE/'installer-active.json').exists() and self.path not in ('/pause','/tasks/pause'):
+            return self.send(409,'程序正在升级，请等待完成后再更改设置。')
         if self.path.startswith('/folder/'):
             return self.folder_request()
         if FOLDERS.guard.exists(): return self.send(409,'正在更改同步文件夹，请等待完成或取消。')

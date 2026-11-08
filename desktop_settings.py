@@ -14,7 +14,7 @@ def view():
     return dict(root=str(t.ROOT),local_path=cfg['local_path'],cloud_path='/115Drive',
         start_with_windows=cfg.get('start_with_windows',True),
         initialized=(t.PRIVATE/'initialized.json').exists(),
-        version='0.3.0-rc1',data_path=str(t.ROOT),sync_tasks=tasks,legacy_enabled=legacy_enabled(t.ROOT))
+        version='0.3.0-rc2',data_path=str(t.ROOT),sync_tasks=tasks,legacy_enabled=legacy_enabled(t.ROOT))
 
 
 def initial_folder(value):
