@@ -24,6 +24,7 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('release',type=Path)
     parser.add_argument('--work',type=Path,required=True,help='A new disposable directory')
+    parser.add_argument('--version',default='0.3.0-rc1')
     args=parser.parse_args()
     release=args.release.resolve();work=args.work.resolve()
     work.mkdir(parents=True,exist_ok=False)
@@ -33,7 +34,7 @@ def main():
         assert Path(name).name==name and name not in hashes,'Invalid checksum filename'
         assert digest((release/name).read_bytes())==value,'Release checksum mismatch: '+name
         hashes[name]=value
-    names=['115Drive-Setup-0.2.1-x64.exe','115Drive-0.2.1-windows-x64.zip','115Drive-0.2.1-source.zip']
+    names=[f'115Drive-Setup-{args.version}-x64.exe',f'115Drive-{args.version}-windows-x64.zip',f'115Drive-{args.version}-source.zip']
     assert all(name in hashes for name in names),'Missing release assets'
     app=work/'app'
     process=subprocess.run([str(release/names[0]),'--extract-only',str(app)],
@@ -54,12 +55,14 @@ def main():
         source_audit.content(names[2],(release/names[2]).read_bytes())
         assert source_audit.report()['ok'],source_audit.report()
         for name in ['README.md','PRIVACY.md','THIRD_PARTY_NOTICES.md','tray/Panel.xaml','tray/Settings.xaml',
+                     'register-shell-menu.ps1','register-sync-root.ps1','tray/keep-local.ico','tray/free-space.ico',
                      'third_party/OpenList-4.2.6-twodrive-source.zip','third_party/OpenList-Frontend-v4.2.6-source.zip']:
             assert portable.read(name)==source.read(name),'Source/package mismatch: '+name
         frozen=CArchiveReader(str(app/'service/TwoDrive.Service.exe'))
         pyz=frozen.open_embedded_archive('PYZ.pyz')
         modules=['twodrive','setup_ui','sync_progress','transfer_recovery','cloud_scan','auth115',
                  'desktop_settings','folder_change','local_paths','sync_errors','local_watch']
+        modules += [name for name in ('cloud_files','sync_tasks','task_backend','task_engine','task_service','task_scheduling','task_names','task_removal','task_shell','cloud_transactions','process_job') if name+'.py' in manifest]
         for name in modules:
             expected=compile(source.read(name+'.py'),name+'.py','exec',dont_inherit=True)
             assert canonical(expected)==canonical(pyz.extract(name)),'Frozen module differs: '+name

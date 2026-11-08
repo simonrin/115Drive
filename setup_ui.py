@@ -11,6 +11,8 @@ import twodrive as t
 from auth115 import QRController
 from folder_change import FolderChanger
 import desktop_settings
+from sync_tasks import TaskStore, legacy_enabled
+import task_service
 
 NONCE=secrets.token_urlsafe(32)
 BUSY=threading.Lock()
@@ -76,7 +78,9 @@ document.querySelector('#form').onsubmit=async e=>{e.preventDefault();let b=docu
 update();setInterval(update,3000);</script></html>'''
 
 def authorization_allowed():
+    if not task_service.authorization_allowed(t.ROOT): return False
     if FOLDERS.guard.exists(): return False
+    if not legacy_enabled(t.ROOT): return True
     if not (t.PRIVATE/'initialized.json').exists():
         return True
     if not (t.ROOT/'runtime/stop').exists():
@@ -88,6 +92,9 @@ def finish_activation():
     from tests.smoke import exercise
     t.status('testing','正在独立目录中测试真实上传、下载、修改、删除和冲突…')
     exercise(cloud=True)
+    if not legacy_enabled(t.ROOT):
+        t.run(['powershell.exe','-NoProfile','-ExecutionPolicy','Bypass','-File',t.ROOT/'install-startup.ps1'])
+        return  # Keep task pause intent and archived legacy paths/history.
     if (t.PRIVATE/'initialized.json').exists():
         cfg=t.read_json(t.CONFIG)
         marker=t.read_json(t.PRIVATE/'initialized.json')
@@ -130,8 +137,9 @@ def retry_saved():
         records=[record for record in t.storages(token) if record['mount_path']=='/115' and record.get('remark')=='Managed by TwoDrive']
         if len(records)!=1 or records[0]['driver'] not in ('115 Cloud','115 Open'):
             raise RuntimeError('没有可复用的 115 连接，请先扫码')
-        t.cloud_folder(token,'/115','115Drive')
-        t.cloud_recovery_folder(token)
+        if legacy_enabled(t.ROOT):
+            t.cloud_folder(token,'/115','115Drive')
+            t.cloud_recovery_folder(token)
         t.write_rclone_config()
         finish_activation()
     except Exception as error:
@@ -166,6 +174,10 @@ class Handler(BaseHTTPRequestHandler):
             result=desktop_settings.view()
             result['nonce']=NONCE
             return self.send(200,json.dumps(result,ensure_ascii=False),'application/json; charset=utf-8')
+        if self.path=='/tasks':
+            try: result=TaskStore(t.ROOT).view()
+            except (ValueError,OSError) as error: return self.send(409,json.dumps(dict(error=str(error)),ensure_ascii=False),'application/json; charset=utf-8')
+            return self.send(200,json.dumps(result,ensure_ascii=False),'application/json; charset=utf-8')
         if self.path=='/qr/status':
             return self.send(200,json.dumps(QR.view(),ensure_ascii=False),'application/json; charset=utf-8')
         parsed=urlsplit(self.path)
@@ -174,7 +186,7 @@ class Handler(BaseHTTPRequestHandler):
             data=QR.get_image(key)
             return self.send(200,data,'image/png') if data else self.send(404,'Not found')
         if self.path=='/status':
-            try: result=t.read_json(t.ROOT/'runtime/status.json')
+            try: result=t.read_json(t.ROOT/('runtime/status.json' if legacy_enabled(t.ROOT) else 'runtime/tasks-status.json'))
             except FileNotFoundError: result=dict(message='等待 115 授权',updated_at='尚未连接')
             result['initialized']=(t.PRIVATE/'initialized.json').exists()
             result['authorization_allowed']=authorization_allowed()
@@ -194,6 +206,26 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith('/folder/'):
             return self.folder_request()
         if FOLDERS.guard.exists(): return self.send(409,'正在更改同步文件夹，请等待完成或取消。')
+        if self.path.startswith('/tasks/'):
+            if not BUSY.acquire(blocking=False): return self.send(409,'正在连接或更改设置，请稍候。')
+            try:
+                length=int(self.headers.get('Content-Length','0'))
+                if not 0<length<=16384: raise ValueError('无效的请求大小。')
+                body=json.loads(self.rfile.read(length).decode('utf-8'))
+                if not isinstance(body,dict): raise ValueError('无效的任务设置。')
+                store=TaskStore(t.ROOT)
+                if self.path=='/tasks/file-policy':
+                    from task_shell import apply_policy
+                    result=apply_policy(store,body)
+                elif self.path=='/tasks/delete':
+                    from task_removal import detach
+                    result=store.remove(body,lambda task,directory:detach(t.ROOT,task,directory),
+                        worker_stopped=lambda task_id:task_service._MANAGER is None or task_service._MANAGER.worker_stopped(task_id))
+                else: result=store.mutate(self.path.rsplit('/',1)[-1],body)
+                return self.send(200,json.dumps(result,ensure_ascii=False),'application/json; charset=utf-8')
+            except (ValueError,OSError,RuntimeError) as error:
+                return self.send(400,json.dumps(dict(error=str(error)),ensure_ascii=False),'application/json; charset=utf-8')
+            finally: BUSY.release()
         if self.path in ('/desktop/preferences','/desktop/initial-folder'):
             if not BUSY.acquire(blocking=False): return self.send(409,'正在处理其他操作，请稍候。')
             try:
@@ -229,6 +261,13 @@ class Handler(BaseHTTPRequestHandler):
             if not BUSY.acquire(blocking=False): return self.send(409,'正在处理，请稍候。')
             threading.Thread(target=activate,args=(access,refresh),daemon=True).start()
             return self.send(202,'正在连接')
+        if self.path in ('/pause','/resume','/sync-now') and not legacy_enabled(t.ROOT):
+            if BUSY.locked(): return self.send(409,'正在连接或测试，请稍候。')
+            try:
+                TaskStore(t.ROOT).set_all_paused(self.path=='/pause')
+                if self.path!='/pause' and task_service._MANAGER is not None: task_service._MANAGER.request_check()
+                return self.send(200,'已暂停全部任务' if self.path=='/pause' else '已请求全部任务检查')
+            except (OSError,ValueError) as error: return self.send(409,str(error))
         if self.path=='/pause':
             if (t.ROOT/'runtime/stop').exists():
                 return self.send(200,'已请求暂停')
@@ -250,6 +289,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send(404,'Not found')
 
     def folder_request(self):
+        if not legacy_enabled(t.ROOT): return self.send(409,'原同步目录已停用，请管理独立文件夹任务。')
         acquired=False
         try:
             length=int(self.headers.get('Content-Length','0'))
@@ -286,6 +326,7 @@ def serve(bootstrap=False):
     if bootstrap and not (t.PRIVATE/'admin.json').exists(): t.bootstrap()
     FOLDERS.recover()
     t.ensure_server()
+    task_service.start(t)
     server.serve_forever()
 
 if __name__=='__main__': serve()

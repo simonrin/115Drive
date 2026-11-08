@@ -2,15 +2,19 @@
 from pathlib import Path
 import uuid
 import twodrive as t
+from sync_tasks import TaskStore, legacy_enabled
 from folder_change import ordinary_path
 
 
 def view():
     cfg=t.read_json(t.CONFIG)
+    try: tasks = TaskStore(t.ROOT).view()
+    except (ValueError, OSError) as error:
+        tasks = dict(revision=0, tasks=[], error=str(error))
     return dict(root=str(t.ROOT),local_path=cfg['local_path'],cloud_path='/115Drive',
         start_with_windows=cfg.get('start_with_windows',True),
         initialized=(t.PRIVATE/'initialized.json').exists(),
-        version='0.2.0',data_path=str(t.ROOT))
+        version='0.3.0-rc1',data_path=str(t.ROOT),sync_tasks=tasks,legacy_enabled=legacy_enabled(t.ROOT))
 
 
 def initial_folder(value):

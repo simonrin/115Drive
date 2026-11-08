@@ -91,6 +91,9 @@ class FolderChanger:
         ordinary_path(self.t, target)
         target = target.resolve()
         source = Path(cfg['local_path']).resolve()
+        from sync_tasks import TaskStore, overlaps
+        if any(overlaps(str(target), row['local_path'], local=True) for row in TaskStore(self.t.ROOT).read()['tasks']):
+            raise ValueError('新位置不能与文件随选任务目录重叠。')
         if target == Path(target.anchor):
             raise ValueError('请选择磁盘下的独立文件夹，不要选择磁盘根目录。')
         for protected in (source, self.t.ROOT.resolve()):

@@ -35,6 +35,15 @@ namespace TwoDrive {
    using(var g=Graphics.FromImage(bitmap)) {
     g.SmoothingMode=SmoothingMode.AntiAlias;g.PixelOffsetMode=PixelOffsetMode.HighQuality;
     g.ScaleTransform(size/64f,size/64f);
+    if(mode=="keep-local") {
+     using(var fill=new SolidBrush(Hex("#247A55")))g.FillEllipse(fill,5,5,54,54);
+     using(var pen=Stroke(Color.White,6))g.DrawLines(pen,new[]{new PointF(17,32),new PointF(28,43),new PointF(47,21)});
+     return bitmap;
+    }
+    if(mode=="free-space") {
+     using(var cloud=Cloud(true))using(var pen=Stroke(Hex("#376F9D"),4))g.DrawPath(pen,cloud);
+     return bitmap;
+    }
     bool compact=size<=32,paused=mode=="paused",error=mode=="error";
     using(var cloud=Cloud(compact))using(var fill=new SolidBrush(Hex("#376F9D")))using(var rim=Stroke(Hex("#ECF3FA"),compact?2.5f:1.5f)) {
      g.FillPath(fill,cloud);g.DrawPath(rim,cloud);

@@ -8,9 +8,11 @@ New-Item -ItemType Directory -Path $twodriveOutput -Force | Out-Null
 Add-Type -AssemblyName System.Drawing
 if (-not ('TwoDrive.CloudBrand' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'CloudBrand.cs') -ReferencedAssemblies System.Drawing }
 [TwoDrive.CloudBrand]::WriteIcon((Join-Path $PSScriptRoot '115Drive.ico'))
+[System.IO.File]::WriteAllBytes((Join-Path $PSScriptRoot 'keep-local.ico'),[TwoDrive.CloudBrand]::IconBytes('keep-local'))
+[System.IO.File]::WriteAllBytes((Join-Path $PSScriptRoot 'free-space.ico'),[TwoDrive.CloudBrand]::IconBytes('free-space'))
 $twodriveReferences = @('System.dll','System.Core.dll','System.Drawing.dll','System.Windows.Forms.dll','System.Web.Extensions.dll','System.Xaml.dll','WPF\WindowsBase.dll','WPF\PresentationCore.dll','WPF\PresentationFramework.dll') | ForEach-Object { '/reference:' + (Join-Path $twodriveFramework $_) }
 $twodriveExe = Join-Path $twodriveOutput 'TwoDriveTray.exe'
-& (Join-Path $twodriveFramework 'csc.exe') /nologo /utf8output /codepage:65001 /target:winexe /platform:anycpu /optimize+ ('/out:'+$twodriveExe) ('/win32manifest:'+(Join-Path $PSScriptRoot 'app.manifest')) ('/win32icon:'+(Join-Path $PSScriptRoot '115Drive.ico')) $twodriveReferences (Join-Path $PSScriptRoot 'TrayApp.cs') (Join-Path $PSScriptRoot 'NativeSettings.cs') (Join-Path $PSScriptRoot 'ActivityActions.cs') (Join-Path $PSScriptRoot 'CloudBrand.cs')
+& (Join-Path $twodriveFramework 'csc.exe') /nologo /utf8output /codepage:65001 /target:winexe /platform:anycpu /optimize+ ('/out:'+$twodriveExe) ('/win32manifest:'+(Join-Path $PSScriptRoot 'app.manifest')) ('/win32icon:'+(Join-Path $PSScriptRoot '115Drive.ico')) $twodriveReferences (Join-Path $PSScriptRoot 'TrayApp.cs') (Join-Path $PSScriptRoot 'NativeSettings.cs') (Join-Path $PSScriptRoot 'TaskSettings.cs') (Join-Path $PSScriptRoot 'ActivityActions.cs') (Join-Path $PSScriptRoot 'CloudBrand.cs') (Join-Path $PSScriptRoot 'ShellActions.cs')
 if ($LASTEXITCODE -ne 0) { throw 'Tray compilation failed.' }
 if ($SelfTest) {
  $twodriveTest = Start-Process -FilePath $twodriveExe -ArgumentList ('--self-test --root "'+$twodriveRoot+'"') -WindowStyle Hidden -PassThru

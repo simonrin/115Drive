@@ -114,6 +114,7 @@ namespace TwoDrive {
   }
 
   string PauseCommand() {
+   if(Object.Equals(Value(state,"task_mode"),true))return Number(state,"active_tasks")>0?"pause":"resume";
    string mode=Text(state,"state");
    if(Object.Equals(Value(state,"requires_action"),true) && WorkerExists())return "pause";
    if(Retrying(state) && WorkerExists())return "pause";
@@ -122,7 +123,7 @@ namespace TwoDrive {
   }
   bool WorkerExists() {
    if(test)return true;
-   var worker=Read("runtime/worker.json");
+   var worker=Read(TaskMode()?"runtime/tasks-status.json":"runtime/worker.json");
    try {
     using(var process=Process.GetProcessById((int)Number(worker,"pid"))) {
      DateTimeOffset started;
@@ -133,11 +134,11 @@ namespace TwoDrive {
   }
   void Refresh() {
    if(!test && File.Exists(Path.Combine(root,"runtime/settings-open.request")))OpenSettings();
-   var model=Read("runtime/status.json");
+   bool tasks=TaskMode();var model=Read(tasks?"runtime/tasks-status.json":"runtime/status.json");
    if(File.Exists(Path.Combine(root,"runtime/private/folder-change-active.json"))) {
     model["state"]="relocating";model["message"]=Text(Read("runtime/folder-change.json"),"message","正在更改同步文件夹，请稍候。");
    }
-   Render(model,Read("runtime/progress.json"),ReadAny("runtime/activity.json"));
+   Render(model,tasks?new Dictionary<string,object>():Read("runtime/progress.json"),tasks?new object[0]:ReadAny("runtime/activity.json"));
   }
 
   void Render(Dictionary<string,object> model,Dictionary<string,object> progress,object recent) {
@@ -187,6 +188,11 @@ namespace TwoDrive {
     if(!String.IsNullOrEmpty(count))title+=" · "+count;
     detail=String.IsNullOrEmpty(path)?"正在核对本地与网盘目录。":path;
    }
+   if(Object.Equals(Value(model,"task_mode"),true) && !workerMissing) {
+    int count=(int)Number(model,"active_tasks"),pausedCount=(int)Number(model,"paused_tasks");
+    title=mode=="idle"?count+" 个任务已同步"+(pausedCount>0?" · "+pausedCount+" 个已暂停":""):mode=="paused"?"全部任务已暂停":mode=="stopping"?"正在暂停全部任务":mode=="error"?"部分任务需要处理":count+" 个任务正在同步";
+    detail=Text(model,"message");
+   }
    Label("StatusTitle").Text=title;Label("StatusSymbol").Text=symbol;
    Label("StatusSymbol").Foreground=Brush(ink);Label("StatusTitle").Foreground=Brush("#243247");
    Find<Border>("StatusCard").Background=problem?Brush(color):Brushes.Transparent;
@@ -206,6 +212,7 @@ namespace TwoDrive {
     "\n同步成功："+(String.IsNullOrEmpty(syncedAt)?"尚无记录":TimeLabel(syncedAt))+
     "\n文件传输："+(String.IsNullOrEmpty(transferredAt)?"尚无记录":TimeLabel(transferredAt));
    bool paused=(!retrying && (mode=="paused" || (mode=="error" && !Object.Equals(Value(model,"requires_action"),true)))) || !WorkerExists();
+   if(Object.Equals(Value(model,"task_mode"),true))paused=Number(model,"active_tasks")==0;
    Label("PauseLabel").Text=paused?"恢复同步":"暂停同步";
    Find<System.Windows.Shapes.Path>("PauseGlyph").Data=Geometry.Parse(paused?"M 6 3 L 18 11 L 6 19 Z":"M 7 4 L 7 18 M 15 4 L 15 18");
    System.Windows.Automation.AutomationProperties.SetName(Find<Button>("PauseButton"),Label("PauseLabel").Text);
@@ -311,7 +318,8 @@ namespace TwoDrive {
    }catch(Exception error){Log(error);Label("StatusTitle").Text="操作未完成";Label("StatusTitle").ToolTip="本机控制服务暂时不可用，请稍后重试或打开连接与设置。";}
    finally{sending=false;Find<Button>("PauseButton").IsEnabled=true;Find<Button>("SyncButton").IsEnabled=true;}
   }
-  void LaunchFolder() {Launch(Text(Read("config.json"),"local_path",Path.Combine(root,"..")));}
+  bool TaskMode() {return Object.Equals(Value(Read("config.json"),"legacy_enabled"),false);}
+  void LaunchFolder() {if(TaskMode()){OpenSettings();return;}Launch(Text(Read("config.json"),"local_path",Path.Combine(root,"..")));}
   void Launch(string target) {if(test){lastCommand="open";return;}try{Process.Start(new ProcessStartInfo(target){UseShellExecute=true});}catch(Exception error){Log(error);}}
   void Log(Exception error) {try{string path=Path.Combine(root,"logs/tray.log");if(File.Exists(path)&&new FileInfo(path).Length>1000000)File.Delete(path);File.AppendAllText(path,DateTime.Now.ToString("s")+" "+error.GetType().Name+": "+error.Message+Environment.NewLine,Encoding.UTF8);}catch{}}
   Drawing.Icon CreateIcon(string mode) {return CloudBrand.CreateIcon(mode,Forms.SystemInformation.SmallIconSize.Width);}
@@ -399,6 +407,14 @@ namespace TwoDrive {
     Render(new Dictionary<string,object>{{"state","error"},{"message","云端存在重复名称"},{"requires_action",true}},new Dictionary<string,object>(),null);
     if(Label("StatusTitle").Text!="同步遇到问题" || Label("PauseLabel").Text!="暂停同步" || PauseCommand()!="pause")throw new Exception("Action-required state cannot pause for reauthorization");
     passed.Add("action_required_waits_for_explicit_retry");
+    Render(new Dictionary<string,object>{{"state","error"},{"task_mode",true},{"task_count",6},{"active_tasks",6}},new Dictionary<string,object>(),null);
+    if(Label("StatusTitle").Text!="部分任务需要处理" || Label("PauseLabel").Text!="暂停同步" || PauseCommand()!="pause")throw new Exception("Task errors prevent global pause");
+    Render(new Dictionary<string,object>{{"state","paused"},{"task_mode",true},{"task_count",6},{"active_tasks",0}},new Dictionary<string,object>(),null);
+    if(Label("StatusTitle").Text!="全部任务已暂停" || PauseCommand()!="resume")throw new Exception("Global task resume mismatch");
+    passed.Add("retired_root_global_task_controls");
+    Render(new Dictionary<string,object>{{"state","idle"},{"task_mode",true},{"task_count",6},{"active_tasks",5},{"paused_tasks",1}},new Dictionary<string,object>(),null);
+    if(Label("StatusTitle").Text!="5 个任务已同步 · 1 个已暂停")throw new Exception("Paused tasks incorrectly reported as synced");
+    passed.Add("paused_tasks_not_reported_as_synced");
     TestActivityActions(passed);
     RenderActivities(Rows(Value(fixture,"activity")).Reverse());
     Find<Button>("SyncButton").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));if(lastCommand!="sync-now")throw new Exception("Sync action mismatch");passed.Add("sync_now_button");
@@ -413,6 +429,7 @@ namespace TwoDrive {
    string root=File.Exists(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"tray/Panel.xaml"))?AppDomain.CurrentDomain.BaseDirectory:Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"../.."));
    int index=Array.IndexOf(args,"--root");if(index>=0&&index+1<args.Length)root=Path.GetFullPath(args[index+1]);
    root=Path.GetFullPath(root);if(root.Length>Path.GetPathRoot(root).Length)root=root.TrimEnd('\\','/');
+   if(args.Contains("--file-policy"))return ApplyShellPolicy(root,args);
    Directory.CreateDirectory(Path.Combine(root,"runtime"));Directory.CreateDirectory(Path.Combine(root,"logs"));
    bool test=args.Contains("--self-test"),show=args.Contains("--show"),showSettings=args.Contains("--settings");
    if(showSettings)File.WriteAllText(Path.Combine(root,"runtime/settings-open.request"),"");

@@ -19,6 +19,7 @@ namespace TwoDrive {
   Window settings;
   DispatcherTimer settingsTimer;
   bool settingsBusy,settingsPolling,renderingSettings,settingsInitialized;
+  bool settingsLegacyEnabled=true;
   string previewTarget="",qrKey="",settingsError="",folderResultVersion="";
   T SF<T>(string name) where T:class {return settings.FindName(name) as T;}
   void Notice(string message) {SF<TextBlock>("SettingsNotice").Text=message;}
@@ -31,7 +32,7 @@ namespace TwoDrive {
    return info;
   }
   Dictionary<string,object> DesktopRequest(string route,object body=null) {
-   using(var client=new LocalClient{Timeout=60000}) {
+   using(var client=new LocalClient{Timeout=route=="tasks/delete"?300000:60000}) {
     try {
      var info=DesktopInfo(client);
      if(route=="desktop")return info;
@@ -53,7 +54,12 @@ namespace TwoDrive {
    }
   }
   void OpenSettings() {
-   string request=Path.Combine(root,"runtime/settings-open.request");if(!test && File.Exists(request))File.Delete(request);
+   string request=Path.Combine(root,"runtime/settings-open.request"),requestedPage="Sync";
+   if(!test && File.Exists(request)) {
+    string value=File.ReadAllText(request).Trim();
+    if(value=="Tasks"||value=="Account"||value=="About")requestedPage=value;
+    File.Delete(request);
+   }
    panel.Hide();
    if(settings==null) {
     using(var stream=File.OpenRead(Path.Combine(root,"tray/Settings.xaml")))settings=(Window)XamlReader.Load(stream);
@@ -62,6 +68,7 @@ namespace TwoDrive {
     SF<Button>("SyncNav").Click+=(s,e)=>SettingsPage("Sync");
     SF<Button>("AccountNav").Click+=(s,e)=>SettingsPage("Account");
     SF<Button>("AboutNav").Click+=(s,e)=>SettingsPage("About");
+    BindTaskSettings();
     SF<Button>("SettingsOpenFolder").Click+=(s,e)=>LaunchFolder();
     SF<Button>("OpenRecoveryButton").Content="查看历史恢复目录";
     SF<Button>("OpenRecoveryButton").IsEnabled=Directory.Exists(Path.Combine(root,"recovery"));
@@ -80,11 +87,12 @@ namespace TwoDrive {
     settingsTimer=new DispatcherTimer{Interval=TimeSpan.FromSeconds(2)};
     settingsTimer.Tick+=(s,e)=>RefreshSettings();
    }
-   settings.Show();settings.Activate();SettingsPage("Sync");
+   settings.Show();settings.Activate();SettingsPage(requestedPage);
    if(test)RenderSettings(new Dictionary<string,object>{{"local_path",Text(Read("config.json"),"local_path")},{"initialized",true},{"start_with_windows",true}},new Dictionary<string,object>{{"state","idle"},{"message","同步正常"}},new Dictionary<string,object>());
    else {settingsTimer.Start();RefreshSettings();}
   }
   void SettingsPage(string page) {
+   if(page=="Tasks")page="Sync";
    foreach(string name in new[]{"Sync","Account","About"}) {
     SF<StackPanel>(name+"Page").Visibility=name==page?Visibility.Visible:Visibility.Collapsed;
     var navigation=SF<Button>(name+"Nav");
@@ -94,7 +102,8 @@ namespace TwoDrive {
     navigation.FontWeight=name==page?FontWeights.SemiBold:FontWeights.Normal;
    }
    SF<TextBlock>("SettingsTitle").Text=page=="Sync"?"同步与备份":page=="Account"?"账户":"关于";
-   SF<TextBlock>("SettingsSubtitle").Text=page=="Sync"?"管理这台电脑上的文件与同步偏好":page=="Account"?"连接你的 115 网盘":"115Drive · 自动双向同步";
+   SF<TextBlock>("SettingsSubtitle").Text=page=="Sync"?"统一管理同步文件夹、保留策略与启动偏好":page=="Account"?"连接你的 115 网盘":"115Drive · 自动双向同步";
+   SF<ScrollViewer>("SettingsScroll").ScrollToTop();
   }
   async void RefreshSettings() {
    if(settings==null||settingsPolling||settingsBusy)return;
@@ -120,14 +129,23 @@ namespace TwoDrive {
   void RenderSettings(Dictionary<string,object> info,Dictionary<string,object> status,Dictionary<string,object> qr) {
    renderingSettings=true;
    settingsInitialized=Value(info,"initialized") as bool? ?? false;
+   settingsLegacyEnabled=!Object.Equals(Value(info,"legacy_enabled"),false);
+   SF<Border>("LegacyTaskCard").Visibility=settingsLegacyEnabled?Visibility.Visible:Visibility.Collapsed;
+   if(!settingsLegacyEnabled)SF<StackPanel>("FolderEditor").Visibility=Visibility.Collapsed;
+   RenderTasks(Map(Value(info,"sync_tasks")));
    SF<TextBlock>("LocalFolderLabel").Text=Text(info,"local_path");
    SF<TextBlock>("LocalFolderLabel").ToolTip=Text(info,"local_path");
+   string folderName=Path.GetFileName(Text(info,"local_path").TrimEnd('\\','/'));
+   SF<TextBlock>("LegacyTaskTitle").Text=String.IsNullOrEmpty(folderName)?"115Drive":folderName;
+   string cloudPath=Text(info,"cloud_path");SF<TextBlock>("LegacyCloudLabel").Text=String.IsNullOrEmpty(cloudPath)?"/115Drive":cloudPath;
+   SF<Button>("ShowAddTask").IsEnabled=settingsInitialized&&!settingsBusy;
    SF<CheckBox>("StartupCheck").IsChecked=Value(info,"start_with_windows") as bool? ?? true;
    SF<TextBlock>("DataFolderLabel").Text="程序与数据位置：\n"+root;
    SF<TextBlock>("SyncStateLabel").Text=Retrying(status)?RetryTitle(status):Text(status,"state")=="idle"?"文件已同步":Text(status,"message");
-   SF<Button>("SettingsPauseButton").Content=!Retrying(status)&&(Text(status,"state")=="paused"||(Text(status,"state")=="error"&&!Object.Equals(Value(status,"requires_action"),true)))?"恢复同步":"暂停同步";
+   SF<TextBlock>("SyncStateLabel").Foreground=Brush(Text(status,"state")=="error"?"#9B4539":"#596779");
+   SF<Button>("SettingsPauseButton").Content=!Retrying(status)&&(Text(status,"state")=="paused"||(Text(status,"state")=="error"&&!Object.Equals(Value(status,"requires_action"),true)))?"启动任务":"暂停任务";
    SF<Button>("SettingsPauseButton").IsEnabled=settingsInitialized&&!settingsBusy;
-   SF<TextBlock>("AccountStateLabel").Text=settingsInitialized?"已连接 · 双向同步 /115Drive":"尚未连接，先确认同步位置，再扫码登录。";
+   SF<TextBlock>("AccountStateLabel").Text=settingsInitialized?"已连接 · "+(taskModels.Length+(settingsLegacyEnabled?1:0))+" 个同步任务":"尚未连接，先确认同步位置，再扫码登录。";
    bool authAllowed=Value(status,"authorization_allowed") as bool? ?? !settingsInitialized;
    string qrState=Text(qr,"state");bool connecting=qrState=="generating"||qrState=="waiting"||qrState=="scanned"||qrState=="connecting";
    SF<Button>("NativeLoginButton").IsEnabled=authAllowed&&!connecting;
@@ -153,7 +171,7 @@ namespace TwoDrive {
    SF<ProgressBar>("FolderProgress").Maximum=Math.Max(1,Number(change,"total_bytes"));SF<ProgressBar>("FolderProgress").Value=Number(change,"bytes");
    SF<Button>("CancelFolderButton").Visibility=moving&&(Value(change,"cancellable") as bool? ?? false)?Visibility.Visible:Visibility.Collapsed;
    if(moving)SF<Button>("ApplyFolderButton").IsEnabled=false;
-   Notice(!String.IsNullOrEmpty(settingsError)?settingsError:moving?"正在安全更改文件夹，等待完成或取消。":"设置自动保存 · 云端同步范围 /115Drive");
+   Notice(!String.IsNullOrEmpty(settingsError)?settingsError:moving?"正在安全更改文件夹，等待完成或取消。":"同一账号 · 各任务独立同步与保留");
    renderingSettings=false;
   }
   void BrowseLocalFolder() {
@@ -189,9 +207,10 @@ namespace TwoDrive {
   async void SettingsCommand(string route,object body=null) {
    lastCommand=route;if(test)return;if(settingsBusy)return;settingsBusy=true;settingsError="";Notice("正在处理…");
    SF<Button>("ApplyFolderButton").IsEnabled=false;SF<CheckBox>("StartupCheck").IsEnabled=false;
-   try {await Task.Run(()=>DesktopRequest(route,body??new{}));if(settings!=null)Notice("已提交，正在更新状态…");}
+   SF<StackPanel>("TaskCards").IsEnabled=false;
+   try {await Task.Run(()=>DesktopRequest(route,body??new{}));if(settings!=null){TaskCommandCompleted(route);Notice(route=="tasks/delete"?"同步任务已删除；网盘文件、本机文件和历史记录已保留。":"已提交，正在更新状态…");}}
    catch(Exception error){settingsError=error.Message;if(settings!=null)Notice(error.Message);}
-   finally {settingsBusy=false;}
+   finally {settingsBusy=false;if(settings!=null){SF<StackPanel>("TaskCards").IsEnabled=true;RefreshSettings();}}
   }
   void CaptureSettings(string name) {
    settings.UpdateLayout();settings.Dispatcher.Invoke((Action)(()=>{}),DispatcherPriority.Render);
@@ -206,12 +225,12 @@ namespace TwoDrive {
    var retryState=new Dictionary<string,object>{{"state","retrying"},{"message","网络连接暂时不可用"},{"retry_at",DateTimeOffset.Now.AddSeconds(60).ToString("o")},{"retry_seconds",60}};
    Render(retryState,new Dictionary<string,object>(),null);RenderSettings(retryInfo,retryState,new Dictionary<string,object>());
    SF<Button>("SettingsPauseButton").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
-   if(!SF<TextBlock>("SyncStateLabel").Text.Contains("01:00 后重试") || Convert.ToString(SF<Button>("SettingsPauseButton").Content)!="暂停同步" || lastCommand!="pause")throw new Exception("Settings retry countdown or pause mismatch");
+   if(!SF<TextBlock>("SyncStateLabel").Text.Contains("01:00 后重试") || Convert.ToString(SF<Button>("SettingsPauseButton").Content)!="暂停任务" || lastCommand!="pause")throw new Exception("Settings retry countdown or pause mismatch");
    passed.Add("native_settings_retry_countdown_and_pause");
    var blockedState=new Dictionary<string,object>{{"state","error"},{"requires_action",true},{"message","请暂停后重新连接"}};
    Render(blockedState,new Dictionary<string,object>(),null);RenderSettings(retryInfo,blockedState,new Dictionary<string,object>());
    SF<Button>("SettingsPauseButton").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
-   if(Convert.ToString(SF<Button>("SettingsPauseButton").Content)!="暂停同步" || lastCommand!="pause")throw new Exception("Blocked settings cannot pause before reconnecting");
+   if(Convert.ToString(SF<Button>("SettingsPauseButton").Content)!="暂停任务" || lastCommand!="pause")throw new Exception("Blocked settings cannot pause before reconnecting");
    passed.Add("native_settings_action_required_can_pause");
    var idleState=new Dictionary<string,object>{{"state","idle"}};
    Render(idleState,new Dictionary<string,object>(),null);RenderSettings(retryInfo,idleState,new Dictionary<string,object>());
@@ -222,7 +241,8 @@ namespace TwoDrive {
    SF<Button>("ApplyFolderButton").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));if(lastCommand!="folder/change")throw new Exception("Folder apply wiring failed");passed.Add("native_folder_preview_and_apply");
    SF<Button>("AccountNav").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));if(SF<StackPanel>("AccountPage").Visibility!=Visibility.Visible)throw new Exception("Account navigation failed");passed.Add("native_account_page");CaptureSettings("settings-preview-account.png");
    SF<Button>("AboutNav").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));if(SF<StackPanel>("AboutPage").Visibility!=Visibility.Visible)throw new Exception("About navigation failed");passed.Add("native_about_page");CaptureSettings("settings-preview-about.png");
-   SettingsPage("Sync");SF<StackPanel>("FolderEditor").Visibility=Visibility.Collapsed;CaptureSettings("settings-preview.png");settings.Close();
+   TestTaskSettings(passed);
+   SettingsPage("Sync");SF<StackPanel>("FolderEditor").Visibility=Visibility.Collapsed;RenderSettings(retryInfo,idleState,new Dictionary<string,object>());CaptureSettings("settings-preview.png");settings.Close();
   }
  }
 }

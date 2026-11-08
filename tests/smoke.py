@@ -9,19 +9,24 @@ import sys
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import twodrive as t
 
+def cloud_test_targets(cfg, run_id):
+    parent='115Drive/' if cfg.get('legacy_enabled',True) else ''
+    prefix='cloud115:'+parent+'.twodrive-test-'
+    backup=('cloud115:115Drive_Recovery_AutoSync/verification/' if parent else 'cloud115:.twodrive-test-recovery-')+run_id
+    return prefix+run_id,backup,prefix
+
 def exercise(cloud=False, recovery=None):
     run_id=dt.datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+secrets.token_hex(4)
     base=t.ROOT/'tests/runs'/run_id
     local=base/'local';local.mkdir(parents=True)
     work=base/'state';backup=base/'backup'
+    cfg=t.read_json(t.CONFIG)
     if cloud:
-        remote='cloud115:115Drive/.twodrive-test-'+run_id
-        remote_backup='cloud115:115Drive_Recovery_AutoSync/verification/'+run_id
+        remote,remote_backup,remote_prefix=cloud_test_targets(cfg,run_id)
     else:
         remote=str(base/'remote');Path(remote).mkdir()
         remote_backup=str(base/'remote-backup')
     results=[]
-    cfg=t.read_json(t.CONFIG)
     recovery=cfg.get('recovery_enabled',False) if recovery is None else recovery
     cfg={**cfg,'recovery_enabled':recovery}
     count=0
@@ -142,7 +147,7 @@ def exercise(cloud=False, recovery=None):
         raise
     finally:
         if cloud:
-            assert remote.startswith('cloud115:115Drive/.twodrive-test-')
+            assert remote==remote_prefix+run_id and remote_prefix.endswith('.twodrive-test-')
             t.rc('purge',remote)
     t.write_json(base/'result.json',report)
     t.write_json(t.ROOT/'runtime'/('cloud-test.json' if cloud else 'local-test.json'),report)

@@ -1,5 +1,16 @@
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
+$cfg = Get-Content -LiteralPath (Join-Path $root 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+if ($cfg.legacy_enabled -eq $false) {
+    $oldSync = Get-ScheduledTask -TaskName 'TwoDrive-115-Sync' -ErrorAction SilentlyContinue
+    if ($oldSync) {
+        if ($oldSync.Actions.WorkingDirectory -ne $root) { throw 'Sync startup belongs to another installation.' }
+        Disable-ScheduledTask -InputObject $oldSync | Out-Null
+        Stop-ScheduledTask -InputObject $oldSync
+    }
+    & (Join-Path $root 'install-tray.ps1')
+    return
+}
 $service = Join-Path $root 'service\TwoDrive.Service.exe'
 if (Test-Path -LiteralPath $service) {
     $workerExe = $service

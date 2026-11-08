@@ -23,6 +23,7 @@ from local_watch import LocalChangeMonitor
 from sync_progress import SyncProgress, SyncPaused, execute as execute_sync
 from sync_errors import ActionRequiredError, TransientSyncError, IndexInvalidError, ScanChangedError, recovery_policy
 from runtime_json import atomic_write_json, write_snapshot
+from sync_tasks import legacy_enabled
 
 ROOT = Path(os.environ.get('TWODRIVE_HOME', Path(__file__).resolve().parent)).resolve()
 PRIVATE = ROOT / 'runtime' / 'private'
@@ -257,8 +258,9 @@ def configure(access, refresh):
     addition = dict(root_folder_id='0',access_token=access,refresh_token=refresh,
                     limit_rate=1,page_size=200,order_by='file_name',order_direction='asc')
     save_storage(token,storage('/115',addition))
-    cloud_folder(token,'/115','115Drive')
-    cloud_recovery_folder(token)
+    if legacy_enabled(ROOT):
+        cloud_folder(token,'/115','115Drive')
+        cloud_recovery_folder(token)
     write_rclone_config()
     status('configured','115 授权已保存，等待实际同步测试。')
 
@@ -275,8 +277,9 @@ def configure_cookie(cookie):
     addition=dict(root_folder_id='0',cookie=cookie,qrcode_token='',
                   qrcode_source='wechatmini',limit_rate=1,page_size=200)
     save_storage(token,storage('/115',addition,driver='115 Cloud'))
-    cloud_folder(token,'/115','115Drive')
-    cloud_recovery_folder(token)
+    if legacy_enabled(ROOT):
+        cloud_folder(token,'/115','115Drive')
+        cloud_recovery_folder(token)
     write_rclone_config()
     record=next(x for x in storages(token) if x['mount_path']=='/115')
     saved=json.loads(record['addition'])
@@ -329,10 +332,11 @@ def native_115_request(cookie,path,query):
         raise TransientSyncError('115 原始目录读取失败，等待重试（代码 '+code+'）')
     return result
 
-def native_115_list(cookie,cid):
+def native_115_list(cookie,cid,*,request=None):
+    request = request or native_115_request
     rows=[];offset=0;expected=None;seen=set()
     while True:
-        response=native_115_request(cookie,'files',dict(aid=1,cid=str(cid),o='file_name',asc=1,
+        response=request(cookie,'files',dict(aid=1,cid=str(cid),o='file_name',asc=1,
             offset=offset,show_dir=1,limit=1150,format='json',snap=0,natsort=0,record_open_time=0,fc_mix=0))
         if str(response.get('cid'))!=str(cid):
             raise IndexInvalidError('115 返回了不同目录，已停止同步')
@@ -433,6 +437,8 @@ def incremental_scanner(cfg):
 
 
 def sync_once(cfg, initial=False, *, interruptible=False, changed_paths=None):
+    if cfg.get('legacy_enabled', True) is not True:
+        raise RuntimeError('原同步任务已停用；请使用独立文件夹任务。')
     progress=SyncProgress(ROOT)
     if interruptible: progress.cancelled=lambda:(ROOT/'runtime/stop').exists() or folder_guard().exists()
     try:
@@ -618,6 +624,7 @@ def wait_for_action(error):
 
 
 def worker_loop():
+    if not legacy_enabled(ROOT): return
     cfg=read_json(CONFIG)
     marker=read_json(PRIVATE/'initialized.json')
     if (marker['local'],marker['remote']) != (cfg['local_path'],cfg['remote_path']):
@@ -707,11 +714,13 @@ def worker_loop():
 
 
 def worker():
+    if not legacy_enabled(ROOT): return
     with worker_lock():
         write_json(ROOT/'runtime/worker.json',dict(pid=os.getpid(),started_at=dt.datetime.now().astimezone().isoformat()))
         while True:
             wait_for_folder_change()
             worker_loop()
+            if not legacy_enabled(ROOT): return
 
 def main():
     parser=argparse.ArgumentParser()
