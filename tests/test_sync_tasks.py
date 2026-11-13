@@ -37,6 +37,18 @@ class TaskConfigurationTests(unittest.TestCase):
             with self.assertRaises(ValueError): self.create(**fields)
         self.assertEqual(len(self.store.read()['tasks']), 1)
 
+    def test_cloud_history_reservation_never_reimports_deleted_versions(self):
+        self.create()
+        before = self.store.path.read_bytes()
+        root = '/115Drive 同步历史-' + 'a' * 32
+        for path in (root, root + '/任务/00', root.upper()):
+            with self.assertRaisesRegex(ValueError, '同步历史'):
+                self.create(local_path=str(self.root/'two'), cloud_path=path)
+            self.assertEqual(before, self.store.path.read_bytes())
+        ordinary = self.create(local_path=str(self.root/'two'), cloud_path='/我的同步历史资料')
+        saved = next(task for task in self.store.read()['tasks'] if task['id'] == ordinary['id'])
+        self.assertEqual(saved['cloud_path'], '/我的同步历史资料')
+
     def test_task_scope_protects_legacy_root(self):
         (self.store.root/'config.json').write_text(json.dumps(dict(local_path=str(self.root/'legacy'), remote_path='cloud115:115Drive')))
         self.store.private.mkdir(parents=True)

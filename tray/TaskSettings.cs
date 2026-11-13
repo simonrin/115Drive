@@ -10,6 +10,16 @@ namespace TwoDrive {
   int taskRevision;
   string editingTask="",taskRenderKey="";
   Dictionary<string,object>[] taskModels=new Dictionary<string,object>[0];
+  bool focusTaskIssues;
+  void OpenSyncIssues() {
+   OpenSettings();SettingsPage("Sync");focusTaskIssues=true;
+  }
+  void FocusTaskIssue() {
+   if(!focusTaskIssues)return;focusTaskIssues=false;
+   var card=SF<StackPanel>("TaskCards").Children.OfType<Border>().FirstOrDefault(c=>Object.Equals(c.Tag,true));
+   if(card==null&&settingsLegacyEnabled)card=SF<Border>("LegacyTaskCard");
+   if(card!=null){settings.UpdateLayout();card.BringIntoView();}
+  }
   void BindTaskSettings() {
    taskRenderKey="";
    SF<Button>("ShowAddTask").Click+=(s,e)=>{SF<Border>("AddTaskPanel").Visibility=Visibility.Visible;SF<Border>("EditTaskPanel").Visibility=Visibility.Collapsed;settings.UpdateLayout();SF<Border>("AddTaskPanel").BringIntoView();SF<TextBox>("NewTaskName").Focus();};
@@ -57,7 +67,7 @@ namespace TwoDrive {
   void RenderTasks(Dictionary<string,object> data) {
    taskRevision=(int)Number(data,"revision");taskModels=Rows(Value(data,"tasks")).ToArray();
    SF<TextBlock>("TaskCountLabel").Text=settingsInitialized?(taskModels.Length+(settingsLegacyEnabled?1:0))+" 个":"尚未连接";
-   string key=json.Serialize(data);if(key==taskRenderKey)return;taskRenderKey=key;
+   string key=json.Serialize(data);if(key==taskRenderKey){FocusTaskIssue();return;}taskRenderKey=key;
    var cards=SF<StackPanel>("TaskCards");cards.Children.Clear();
    string error=Text(data,"error");
    if(!String.IsNullOrEmpty(error))cards.Children.Add(new TextBlock{Text=error,TextWrapping=TextWrapping.Wrap,Foreground=Brush("#9B4539"),Margin=new Thickness(0,0,0,16)});
@@ -82,8 +92,9 @@ namespace TwoDrive {
     remove.Click+=(s,e)=>{if(remove.IsEnabled&&!settingsBusy)SettingsCommand("tasks/delete",new{revision=taskRevision,id=id});};
     foreach(var button in new[]{open,edit,pause,remove}){button.Margin=new Thickness(0,0,8,6);actions.Children.Add(button);}body.Children.Add(actions);
     body.Children.Add(new TextBlock{Text="云端保留替换和删除历史，占用网盘空间。",Style=(Style)settings.FindResource("Note"),FontSize=11,LineHeight=17,Margin=new Thickness(0,4,0,0)});
-    cards.Children.Add(new Border{Style=(Style)settings.FindResource("Card"),Child=body});
+    cards.Children.Add(new Border{Style=(Style)settings.FindResource("Card"),Child=body,Tag=Text(status,"state")=="error"});
    }
+   FocusTaskIssue();
   }
   void EditTask(Dictionary<string,object> task) {
    editingTask=Text(task,"id");SF<TextBlock>("EditTaskTitle").Text=Text(task,"name")+" · 保留策略";
@@ -163,6 +174,19 @@ namespace TwoDrive {
    TaskCommandCompleted("tasks/delete");
    if(SF<Border>("EditTaskPanel").Visibility!=Visibility.Collapsed||editingTask!="")throw new Exception("Deleted task editor remains open");
    passed.Add("task_delete_waits_for_worker_stop_and_closes_editor");
+   var issueTasks=new List<object>();
+   for(int i=0;i<6;i++) {
+    var item=new Dictionary<string,object>((Dictionary<string,object>)tasks[0]);
+    item["id"]=i.ToString();item["name"]=i==5?"需要检查的图片任务":"正常任务 "+i;
+    item["status"]=new Dictionary<string,object>{{"state",i==5?"error":"idle"},{"message",i==5?"云端目录身份变化，请检查目录位置。":"本轮文件核对完成"}};
+    issueTasks.Add(item);
+   }
+   focusTaskIssues=true;RenderTasks(new Dictionary<string,object>{{"revision",11},{"tasks",issueTasks.ToArray()}});
+   settings.UpdateLayout();settings.Dispatcher.Invoke((Action)(()=>{}),System.Windows.Threading.DispatcherPriority.Render);
+   if(focusTaskIssues||SF<ScrollViewer>("SettingsScroll").VerticalOffset<=0)throw new Exception("Issue action did not scroll to affected task");
+   var issueBody=(StackPanel)((Border)SF<StackPanel>("TaskCards").Children[5]).Child;
+   if(!issueBody.Children.OfType<TextBlock>().Any(t=>t.Text.Contains("云端目录身份变化")))throw new Exception("Issue reason missing from task card");
+   CaptureSettings("settings-preview-issues.png");passed.Add("issue_action_locates_task_and_reason");
    settingsLegacyEnabled=true;
    settings.Width=width;settings.Height=height;
    SF<Border>("AddTaskPanel").Visibility=Visibility.Collapsed;SF<Border>("EditTaskPanel").Visibility=Visibility.Collapsed;

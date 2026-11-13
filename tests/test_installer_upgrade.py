@@ -57,6 +57,26 @@ class InstallerTests(unittest.TestCase):
         again=install(self.payload,self.root)
         self.assertEqual(again['replaced'],0);self.preserved()
 
+    def test_badge_program_upgrade_preserves_personal_folder_icons(self):
+        additions = {'register-folder-badge.ps1': b'badge entry point',
+                     'register-account-navigation.ps1': b'account navigation',
+                     'tray/FolderBadge.dll': b'badge renderer',
+                     'tray/115Drive-folder.ico': b'folder fallback'}
+        for name, data in additions.items():
+            write(self.payload/name, data)
+        manifest = json.loads((self.payload/'install-manifest.json').read_text())
+        manifest['files'].update({name: digest(self.payload/name) for name in additions})
+        write(self.payload/'install-manifest.json', json.dumps(manifest))
+        personal = self.root/'runtime/shell/folder-icons/task.ico'
+        backup = self.root/'runtime/shell/folder-icons/task.json'
+        write(personal, b'personalized icon'); write(backup, b'original folder appearance')
+        install(self.payload, self.root)
+        for name, data in additions.items():
+            self.assertEqual((self.root/name).read_bytes(), data)
+        self.assertEqual(personal.read_bytes(), b'personalized icon')
+        self.assertEqual(backup.read_bytes(), b'original folder appearance')
+        self.preserved()
+
     def test_partial_replacement_failure_restores_entire_old_program(self):
         def fail(event,tx):
             if event=='after_replace': raise OSError('simulated file lock')

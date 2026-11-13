@@ -76,7 +76,10 @@ def relative_path(value, *, empty=False):
 def cloud_path(value):
     if not isinstance(value, str) or not value.startswith('/'):
         raise ValueError('请输入云端绝对目录，例如 /资料。')
-    return '/' + relative_path(value.rstrip('/')[1:])
+    relative = relative_path(value.rstrip('/')[1:])
+    if re.fullmatch(r'115Drive 同步历史-[0-9a-f]{32}', relative.split('/')[0], re.IGNORECASE):
+        raise ValueError('此目录是同步历史保留区，不能作为同步任务，以免重新同步已删除文件。')
+    return '/' + relative
 
 
 def local_path(value):

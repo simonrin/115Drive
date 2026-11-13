@@ -1,5 +1,6 @@
 param([switch]$SelfTest,[string]$OutputDirectory)
 $ErrorActionPreference = 'Stop'
+& (Join-Path $PSScriptRoot 'build-folder-badge.ps1')
 $twodriveRoot = Split-Path $PSScriptRoot
 $twodriveFramework = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319'
 $twodriveOutput = Join-Path $twodriveRoot 'bin\TwoDriveTray'
@@ -8,6 +9,7 @@ New-Item -ItemType Directory -Path $twodriveOutput -Force | Out-Null
 Add-Type -AssemblyName System.Drawing
 if (-not ('TwoDrive.CloudBrand' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'CloudBrand.cs') -ReferencedAssemblies System.Drawing }
 [TwoDrive.CloudBrand]::WriteIcon((Join-Path $PSScriptRoot '115Drive.ico'))
+[System.IO.File]::WriteAllBytes((Join-Path $PSScriptRoot '115Drive-folder.ico'),[TwoDrive.CloudBrand]::IconBytes('folder'))
 [System.IO.File]::WriteAllBytes((Join-Path $PSScriptRoot 'keep-local.ico'),[TwoDrive.CloudBrand]::IconBytes('keep-local'))
 [System.IO.File]::WriteAllBytes((Join-Path $PSScriptRoot 'free-space.ico'),[TwoDrive.CloudBrand]::IconBytes('free-space'))
 $twodriveReferences = @('System.dll','System.Core.dll','System.Drawing.dll','System.Windows.Forms.dll','System.Web.Extensions.dll','System.Xaml.dll','WPF\WindowsBase.dll','WPF\PresentationCore.dll','WPF\PresentationFramework.dll') | ForEach-Object { '/reference:' + (Join-Path $twodriveFramework $_) }

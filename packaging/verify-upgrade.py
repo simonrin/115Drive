@@ -29,8 +29,11 @@ def main():
         write(app/name,('generated preserved content '+name).encode())
     for task_id in task_ids:write(app/'runtime/private/tasks'/task_id/'state.json',dict(version=1,items={'保留文件':dict(size=10,sha1='0'*40)},pending=None))
     write(local/'已下载.txt','generated local content'.encode());os.chmod(local/'已下载.txt',stat.S_IREAD)
-    database=app/'runtime/private/openlist/data.db';database.parent.mkdir(parents=True,exist_ok=True)
-    db=sqlite3.connect(database);db.execute('PRAGMA journal_mode=WAL');db.execute('CREATE TABLE preserved(value TEXT)');db.execute('INSERT INTO preserved VALUES (?)',('original',));db.commit()
+    databases=[]
+    for database in (app/'runtime/private/openlist/data.db',app/'runtime/private/tasks'/task_ids[0]/'state.sqlite3'):
+        database.parent.mkdir(parents=True,exist_ok=True)
+        db=sqlite3.connect(database);db.execute('PRAGMA journal_mode=WAL');db.execute('CREATE TABLE preserved(value TEXT)');db.execute('INSERT INTO preserved VALUES (?)',('original',));db.commit()
+        databases.append(db)
     fetches=[]
     def no_fetch(identity,cancel):fetches.append(identity);raise AssertionError('Installer must not hydrate files')
     native=CloudFiles(work/'仅联机',uuid.uuid4().hex,no_fetch)
@@ -49,8 +52,9 @@ def main():
             after=native.state(online)
             assert after['partial'] and after['on_disk']==0 and online.stat().st_ino==online_id and not fetches
             result['checks'].append('old_install_upgrade_preserves_data' if iteration==0 else 'repeat_install_preserves_data')
-        assert db.execute('PRAGMA integrity_check').fetchone()[0]=='ok'
-        assert db.execute('SELECT value FROM preserved').fetchone()[0]=='original'
+        for db in databases:
+            assert db.execute('PRAGMA integrity_check').fetchone()[0]=='ok'
+            assert db.execute('SELECT value FROM preserved').fetchone()[0]=='original'
         fresh=work/'全新安装'
         completed=subprocess.run([str(args.installer.resolve()),'--install-to',str(fresh)+os.sep],timeout=240,creationflags=subprocess.CREATE_NO_WINDOW)
         assert completed.returncode==0,Path(str(fresh)+'.error.txt').read_text() if Path(str(fresh)+'.error.txt').exists() else completed.returncode
@@ -62,7 +66,7 @@ def main():
         result.update(ok=True,protected_files=len(originals),online_hydration_count=len(fetches),version=manifest['version'])
         result['checks']+=['six_task_ids_policies_pause_states_and_revision_unchanged','open_sqlite_wal_and_history_unchanged','downloaded_file_identity_attributes_unchanged','online_placeholder_identity_and_zero_cached_bytes_unchanged','all_program_files_match_new_manifest']
     finally:
-        db.close()
+        for db in databases:db.close()
         try:
             native.discard_online('未下载.bin');native.close();native.unregister()
         finally:

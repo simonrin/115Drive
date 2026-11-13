@@ -15,9 +15,11 @@ from sync_tasks import file_lock, relative_path, placeholder_stat
 MANIFEST = 'install-manifest.json'
 SINGLE_FILES = {'115Drive.exe', 'filters.txt', 'install-startup.ps1', 'install-tray.ps1',
                 'set-startup.ps1', 'register-sync-root.ps1', 'register-shell-menu.ps1',
+                'register-account-navigation.ps1', 'register-folder-badge.ps1',
                 'README.md', 'LICENSE', 'PRIVACY.md', 'CONTRIBUTING.md', 'THIRD_PARTY_NOTICES.md'}
 PREFIXES = ('service/', 'docs/', 'licenses/', 'third_party/')
 OTHER_FILES = {'tray/Panel.xaml', 'tray/Settings.xaml', 'tray/keep-local.ico', 'tray/free-space.ico',
+               'tray/115Drive-folder.ico', 'tray/FolderBadge.dll',
                'bin/openlist-v4.2.6/openlist.exe',
                'bin/rclone-v1.75.1/rclone-v1.75.1-windows-amd64/rclone.exe'}
 

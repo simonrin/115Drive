@@ -1,4 +1,4 @@
-param([string]$Python='python.exe',[string]$DependencyRoot,[string]$OutputDirectory,[ValidatePattern('^[0-9]+\.[0-9]+\.[0-9]+(?:-[a-z0-9.]+)?$')][string]$Version='0.3.0-rc2')
+param([string]$Python='python.exe',[string]$DependencyRoot,[string]$OutputDirectory,[ValidatePattern('^[0-9]+\.[0-9]+(?:\.[0-9]+)?(?:-[a-z0-9.]+)?$')][string]$Version='1.0')
 $ErrorActionPreference='Stop'
 $root=Split-Path $PSScriptRoot
 if (-not $DependencyRoot) { $DependencyRoot=$root }
@@ -15,8 +15,9 @@ Copy-Item -LiteralPath (Join-Path $build 'service-dist\TwoDrive.Service') -Desti
 if ($LASTEXITCODE) { throw 'Native UI compilation failed' }
 Copy-Item -LiteralPath (Join-Path $build 'tray\TwoDriveTray.exe') -Destination (Join-Path $stage '115Drive.exe')
 foreach ($directory in @('tray','bin\openlist-v4.2.6','bin\rclone-v1.75.1\rclone-v1.75.1-windows-amd64','licenses','third_party')) { New-Item -ItemType Directory -Path (Join-Path $stage $directory) -Force | Out-Null }
-foreach ($file in @('Panel.xaml','Settings.xaml','keep-local.ico','free-space.ico')) { Copy-Item -LiteralPath (Join-Path $root ('tray\'+$file)) -Destination (Join-Path $stage 'tray') }
-foreach ($file in @('filters.txt','install-startup.ps1','install-tray.ps1','set-startup.ps1','register-sync-root.ps1','register-shell-menu.ps1','installer-process.ps1','LICENSE','README.md','PRIVACY.md','CONTRIBUTING.md','THIRD_PARTY_NOTICES.md')) { Copy-Item -LiteralPath (Join-Path $root $file) -Destination $stage }
+foreach ($file in @('Panel.xaml','Settings.xaml','keep-local.ico','free-space.ico','115Drive-folder.ico','FolderBadge.dll')) { Copy-Item -LiteralPath (Join-Path $root ('tray\'+$file)) -Destination (Join-Path $stage 'tray') }
+Copy-Item -LiteralPath (Join-Path $root 'register-folder-badge.ps1') -Destination $stage
+foreach ($file in @('filters.txt','install-startup.ps1','install-tray.ps1','set-startup.ps1','register-sync-root.ps1','register-shell-menu.ps1','register-account-navigation.ps1','installer-process.ps1','LICENSE','README.md','PRIVACY.md','CONTRIBUTING.md','THIRD_PARTY_NOTICES.md')) { Copy-Item -LiteralPath (Join-Path $root $file) -Destination $stage }
 Copy-Item -LiteralPath (Join-Path $root 'docs') -Destination (Join-Path $stage 'docs') -Recurse
 Copy-Item -LiteralPath (Join-Path $DependencyRoot 'bin\openlist-v4.2.6\openlist.exe') -Destination (Join-Path $stage 'bin\openlist-v4.2.6')
 Copy-Item -LiteralPath (Join-Path $DependencyRoot 'bin\rclone-v1.75.1\rclone-v1.75.1-windows-amd64\rclone.exe') -Destination (Join-Path $stage 'bin\rclone-v1.75.1\rclone-v1.75.1-windows-amd64')

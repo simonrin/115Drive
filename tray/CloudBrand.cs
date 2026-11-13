@@ -29,8 +29,29 @@ namespace TwoDrive {
   static Pen Stroke(Color color,float width) {
    return new Pen(color,width){StartCap=LineCap.Round,EndCap=LineCap.Round,LineJoin=LineJoin.Round};
   }
+  static Bitmap RenderFolder(int size) {
+   var bitmap=new Bitmap(size,size,PixelFormat.Format32bppArgb);
+   using(var g=Graphics.FromImage(bitmap)) {
+    g.SmoothingMode=SmoothingMode.AntiAlias;g.PixelOffsetMode=PixelOffsetMode.HighQuality;
+    g.InterpolationMode=InterpolationMode.HighQualityBicubic;
+    g.ScaleTransform(size/64f,size/64f);
+    // Upright yellow folder, with the same cloud/curl used by the app in front.
+    using(var back=new SolidBrush(Hex("#FFDF7E")))
+     g.FillPolygon(back,new[]{new PointF(12,5),new PointF(45,5),new PointF(47,7),new PointF(47,55),new PointF(24,61),new PointF(12,53)});
+    using(var inside=new SolidBrush(Hex("#F3CC62")))
+     g.FillPolygon(inside,new[]{new PointF(12,5),new PointF(25,16),new PointF(45,16),new PointF(45,5)});
+    using(var face=new SolidBrush(Hex("#FFE593")))
+     g.FillPolygon(face,new[]{new PointF(25,16),new PointF(47,16),new PointF(47,55),new PointF(25,61)});
+    using(var edge=new SolidBrush(Hex("#FFF0B4")))
+     g.FillPolygon(edge,new[]{new PointF(12,5),new PointF(25,16),new PointF(25,61),new PointF(12,53)});
+    // Render the original mark at sufficient detail to retain its white curl.
+    using(var mark=Render(Math.Max(64,size),"app"))g.DrawImage(mark,new RectangleF(22,26,42,42));
+   }
+   return bitmap;
+  }
   public static Bitmap Render(int size,string mode) {
    if(size<16||size>1024)throw new ArgumentOutOfRangeException("size");
+   if(mode=="folder")return RenderFolder(size);
    var bitmap=new Bitmap(size,size,PixelFormat.Format32bppArgb);
    using(var g=Graphics.FromImage(bitmap)) {
     g.SmoothingMode=SmoothingMode.AntiAlias;g.PixelOffsetMode=PixelOffsetMode.HighQuality;

@@ -4,8 +4,34 @@ from __future__ import annotations
 import ctypes
 from ctypes import wintypes
 import os
+import struct
 from pathlib import Path
 import time
+
+
+class DirectoryEvent(str):
+    """String-compatible notification with validated relative paths."""
+    def __new__(cls, changes):
+        value = super().__new__(cls, 'event')
+        value.changes = tuple(changes)
+        return value
+
+
+def decode_notifications(data):
+    changes, offset = [], 0
+    while True:
+        if len(data)-offset < 12: raise ValueError('Truncated file notification')
+        step, action, size = struct.unpack_from('<III', data, offset)
+        if action not in (1, 2, 3, 4, 5) or size % 2 or size == 0 or offset+12+size > len(data):
+            raise ValueError('Invalid file notification')
+        name = data[offset+12:offset+12+size].decode('utf-16-le').replace('\\', '/')
+        if name.startswith('/') or any(x in ('', '.', '..') for x in name.split('/')) or ':' in name or '\x00' in name:
+            raise ValueError('Unsafe file notification path')
+        changes.append((action, name))
+        if step == 0: return DirectoryEvent(changes)
+        if step < 12+size or step % 4 or offset+step >= len(data):
+            raise ValueError('Invalid notification chain')
+        offset += step
 
 
 class WindowsDirectoryEvents:
@@ -78,8 +104,11 @@ class WindowsDirectoryEvents:
             self.pending = False
             raise ctypes.WinError(error)
         self.pending = False
+        data = self.buffer.raw[:count.value]  # Copy before the next async read can reuse the buffer.
         self._arm()
-        return 'event' if count.value else 'overflow'
+        if not data: return 'overflow'
+        try: return decode_notifications(data)
+        except (ValueError, UnicodeError): return 'overflow'
 
     def close(self):
         if self.handle:
@@ -99,9 +128,12 @@ class WindowsDirectoryEvents:
 
 class LocalChangeMonitor:
     def __init__(self, root, scan, *, full_scan_seconds=60, poll_seconds=2,
-                 enabled=True, notify=None, watcher_factory=None, clock=None):
+                 enabled=True, notify=None, watcher_factory=None, clock=None, incremental_scan=None):
         self.root = Path(root)
         self.scan = scan
+        self.incremental_scan = incremental_scan
+        self.pending_paths = set()
+        self.needs_full_scan = False
         self.full_scan_seconds = max(1, float(full_scan_seconds))
         self.poll_seconds = max(.1, float(poll_seconds))
         self.enabled = enabled
@@ -131,6 +163,7 @@ class LocalChangeMonitor:
             self.close()
             self.next_retry = 0
             reason = 'root_replaced'
+            self.needs_full_scan = True
         if self.enabled and not self.watcher and now >= self.next_retry:
             try:
                 self.watcher = self.factory(self.root)
@@ -148,10 +181,17 @@ class LocalChangeMonitor:
                     self.metrics['event_batches'] += 1
                     if event == 'overflow':
                         self.metrics['overflows'] += 1
-                    reason = event
+                    reason = str(event)
+                    changes = getattr(event, 'changes', ())
+                    if changes:
+                        self.pending_paths.update(name for _, name in changes)
+                    else:
+                        self.needs_full_scan = True
             except OSError as error:
                 self._failed(error, now)
                 reason = 'watcher_error'
+        if self.needs_full_scan and reason is None: reason = 'recovery'
+        if self.pending_paths and reason is None: reason = 'event'
         if self.current is None:
             reason = 'startup'
         elif force:
@@ -159,9 +199,16 @@ class LocalChangeMonitor:
         elif reason is None and now >= self.next_scan:
             reason = 'periodic' if self.watcher else 'polling'
         if reason:
-            current = self.scan(self.root)  # Failed scans never advance the baseline.
+            incremental = reason == 'event' and self.pending_paths and self.incremental_scan and self.current is not None and not self.needs_full_scan
+            self.needs_full_scan = not bool(incremental)  # Keep failed work pending.
+            current = (self.incremental_scan(self.current, set(self.pending_paths)) if incremental
+                       else self.scan(self.root))
             self.current = current
-            self.next_scan = self.clock() + (self.full_scan_seconds if self.watcher else self.poll_seconds)
+            self.pending_paths.clear()
+            self.needs_full_scan = False
+            if not incremental:
+                self.next_scan = self.clock() + (self.full_scan_seconds if self.watcher else self.poll_seconds)
+            self.metrics['incremental_scans'] = self.metrics.get('incremental_scans', 0) + int(bool(incremental))
             self.metrics['mode'] = 'events' if self.watcher else 'polling'
             self.metrics['scans'] += 1
             counts = self.metrics['scan_reasons']

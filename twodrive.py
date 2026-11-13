@@ -24,6 +24,7 @@ from sync_progress import SyncProgress, SyncPaused, execute as execute_sync
 from sync_errors import ActionRequiredError, TransientSyncError, IndexInvalidError, ScanChangedError, recovery_policy
 from runtime_json import atomic_write_json, write_snapshot
 from sync_tasks import legacy_enabled
+from account_transport import AccountHTTP
 
 ROOT = Path(os.environ.get('TWODRIVE_HOME', Path(__file__).resolve().parent)).resolve()
 PRIVATE = ROOT / 'runtime' / 'private'
@@ -34,7 +35,7 @@ CONFIG = ROOT / 'config.json'
 SENTINEL = '.twodrive-health'
 API = 'http://127.0.0.1:5244'
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+HTTP = AccountHTTP()
 log = logging.getLogger('twodrive')
 _native_last_request = 0.0
 _incremental_scanners = {}

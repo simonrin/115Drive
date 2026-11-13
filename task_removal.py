@@ -7,6 +7,7 @@ import time
 from cloud_files import CloudFiles
 from runtime_json import atomic_write_json
 from sync_tasks import placeholder_stat, relative_path
+from sync_state_store import DATABASE, StateStore, load_state
 
 
 def shell_unregister(root, task):
@@ -21,7 +22,7 @@ def shell_unregister(root, task):
 def detach(root, task, directory, *, native_factory=CloudFiles, unregister_shell=shell_unregister):
     directory, local = Path(directory), Path(task['local_path'])
     state_path, journal = directory/'state.json', directory/'removal.json'
-    state = json.loads(state_path.read_text(encoding='utf-8')) if state_path.exists() else None
+    state = load_state(directory) if state_path.exists() or (directory/DATABASE).exists() else None
     if state is not None:
         if state.get('task') != task['id'] or state.get('local') != str(local) or state.get('cloud') != task['cloud_path']:
             raise ValueError('任务同步基线与目录不一致，不能删除任务。')
@@ -38,6 +39,12 @@ def detach(root, task, directory, *, native_factory=CloudFiles, unregister_shell
             finished = tx.get('committed') or tx.get('aborted') and tx.get('abort_complete')
         if not finished:
             raise ValueError('任务仍有未完成的云端事务，请恢复处理完成后再暂停删除。')
+    if (directory/DATABASE).exists():
+        # Paused task removal must preserve the current canonical history even
+        # if the last process exited before its compatibility export.
+        store = StateStore(directory)
+        try: store.load(); store.export()
+        finally: store.close(export=False)
     native = native_factory(local, task['id'], None) if local.exists() else None
     root_id = local.stat().st_ino if native else None
     owned = native.registered() if native else False

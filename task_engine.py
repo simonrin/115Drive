@@ -17,6 +17,10 @@ from task_backend import sha1, content, version, RemoteChanged, ConcurrentChange
 from cloud_transactions import internal
 from local_watch import LocalChangeMonitor
 from task_names import excluded
+from task_activity import TaskActivity
+from task_scheduling import work_priority
+from sync_state_store import StateStore, load_state
+from local_change_index import LocalChangeIndex
 
 
 class LinkedCancellation:
@@ -41,11 +45,18 @@ class TaskEngine:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.root = Path(task['local_path'])
         self.cancel = threading.Event()
+        self.scan_complete = None
+        if backend is not None:
+            backend.cancelled = self.cancel
+            backend.progress = self.scan_progress
         self.access_lock = threading.RLock()
         self.access, self.open_counts = {}, {}
         self.prefetched = {}
         self.background_hydrations = set()
         self.monitor = None
+        self.local_index = None
+        self._index_attempted = False
+        self._journal_checked_at = 0
         self._last_local = None
         self._last_remote = None
         self.metrics = dict(state_writes=0, inventory_scans=0, remote_scans=0, cycles=0)
@@ -54,7 +65,7 @@ class TaskEngine:
         self.state_path = self.directory/'state.json'
         existed = self.state_path.exists()
         try:
-            self.state = json.loads(self.state_path.read_text(encoding='utf-8'))
+            self.state = load_state(self.directory)
         except FileNotFoundError:
             self.state = dict(version=1, task=task['id'], local=str(self.root), cloud=task['cloud_path'],
                               backend=None, items={}, pending=None)
@@ -65,32 +76,74 @@ class TaskEngine:
             if not isinstance(row, dict) or not isinstance(row.get('remote'), dict):
                 raise RuntimeError('文件同步基线损坏。')
         self.started = False
-        self._saved_state = copy.deepcopy(self.state) if existed else None
+        self._saved_state = copy.deepcopy(self.state) if existed or (self.directory/'state.sqlite3').exists() else None
+        self.state_store = None
         self._last_status = None
+        self.activity = TaskActivity(self.directory)
+        self._delete_done = 0
+        self._delete_total = 0
+        self._policy_key = None
+        self.more_work = False
+        if (self.directory/'state.sqlite3').exists(): self.enable_state_store()
+
+    def enable_state_store(self):
+        if self.state_store is None:
+            store = StateStore(self.directory, guard_legacy=True)
+            try: store.save(self.state, self._saved_state)
+            except BaseException:
+                store.close(export=False)
+                raise
+            self.state_store = store
+            self._saved_state = copy.deepcopy(self.state)
 
     def save(self):
         if self.state == self._saved_state: return False
-        atomic_write_json(self.state_path, self.state, indent=2, durable=True)
+        if self.state_store is None:
+            atomic_write_json(self.state_path, self.state, indent=2, durable=True)
+        else:
+            self.state_store.save(self.state, self._saved_state)
         self._saved_state = copy.deepcopy(self.state)
         self.metrics['state_writes'] += 1
         return True
 
     def status(self, state, message, **extra):
+        if 'progress' not in extra and state in ('uploading', 'downloading'):
+            extra['progress'] = dict(phase=state, name=extra.get('file', ''), completed=0, total=1)
         value = dict(state=state, message=message, task_id=self.task['id'], **extra)
         if value == self._last_status: return
         if write_snapshot(self.directory/'status.json', dict(value, updated_at=time.time())):
             self._last_status = value
 
     def enable_watch(self):
-        self.monitor = LocalChangeMonitor(self.root, lambda _: self.inventory(),
-            full_scan_seconds=60, poll_seconds=2)
+        self.local_index = LocalChangeIndex(self.root, self.directory)
+        self.monitor = LocalChangeMonitor(self.root, lambda _: self.local_snapshot(),
+            full_scan_seconds=1800, poll_seconds=2, incremental_scan=self.refresh_inventory)
+
+    def local_snapshot(self):
+        if self.local_index is not None and not self._index_attempted:
+            self._index_attempted = True
+            result = self.local_index.recover(self.inventory, self.refresh_inventory)
+            self.metrics['local_recovery'] = dict(mode=result.mode, journal_available=self.local_index.available)
+            return result.snapshot
+        return self.inventory()
 
     def local_changed(self):
-        return self.monitor is not None and self.monitor.poll() != self._last_local
+        if self.monitor is None: return False
+        current = self.monitor.poll()
+        if self.local_index is not None and self.local_index.available:
+            self.local_index.observe(current)
+        if self.local_index is not None and self.local_index.available and time.monotonic()-self._journal_checked_at >= 1:
+            result = self.local_index.update(self.inventory, self.refresh_inventory)
+            current = self.monitor.current = result.snapshot
+            self.metrics['local_recovery'] = dict(mode=result.mode, journal_available=self.local_index.available)
+            self._journal_checked_at = time.monotonic()
+        return current != self._last_local
 
     def start(self, registrar=None):
         # Validate the authoritative backend before creating/registering a root.
-        remote = getattr(self.backend, 'recovery_snapshot', self.backend.snapshot)()
+        started = time.monotonic()
+        remote = getattr(self.backend, 'startup_snapshot',
+                         getattr(self.backend, 'recovery_snapshot', self.backend.snapshot))()
         self._check_backend()
         root_id = self.state.get('local_root_id')
         if root_id is not None and (not self.root.exists() or self.root.stat().st_ino != root_id):
@@ -104,7 +157,13 @@ class TaskEngine:
         self.state['backend'] = self.backend.identity
         self.state['local_root_id'] = self.root.stat().st_ino
         self.save()
+        self.metrics['startup_seconds'] = round(time.monotonic()-started, 3)
         return remote
+
+    def scan_progress(self, checked, pending, entries, elapsed):
+        self.status('checking', f'正在核对云端目录 · 已检查 {checked} 个目录，{entries} 项',
+                    scan=dict(directories=checked, pending=pending, entries=entries, seconds=elapsed),
+                    progress=dict(phase='scanning', completed=checked, total=checked+pending, entries=entries))
 
     @property
     def health_name(self):
@@ -131,8 +190,9 @@ class TaskEngine:
 
     def remote_snapshot(self, *, batch=None):
         self.metrics['remote_scans'] += 1
-        rows = (self.backend.batch_snapshot(batch) if batch is not None and hasattr(self.backend, 'batch_snapshot')
-                else self.backend.snapshot())
+        with work_priority('background'):
+            rows = (self.backend.batch_snapshot(batch) if batch is not None and hasattr(self.backend, 'batch_snapshot')
+                    else getattr(self.backend, 'scan_snapshot', self.backend.snapshot)())
         self._check_backend()
         self._prepare_health(rows)
         return {p: row for p, row in rows.items() if not p.startswith('.twodrive-health-') and not excluded(p)}
@@ -143,12 +203,26 @@ class TaskEngine:
 
     def close(self):
         self.cancel.set()
-        if self.monitor:
-            self.monitor.close()
-            self.monitor = None
-        if self.started:
-            self.native.close()
-            self.started = False
+        errors = []
+        try:
+            if self.monitor:
+                try: self.monitor.close()
+                except BaseException as error: errors.append(error)
+                finally: self.monitor = None
+            if self.local_index is not None:
+                try: self.local_index.close()
+                except BaseException as error: errors.append(error)
+                finally: self.local_index = None
+            if self.started:
+                try: self.native.close()
+                except BaseException as error: errors.append(error)
+                else: self.started = False
+        finally:
+            if self.state_store is not None:
+                try: self.state_store.close()
+                except BaseException as error: errors.append(error)
+                finally: self.state_store = None
+        if errors: raise errors[0]
 
     def event(self, kind, identity):
         if kind=='fetch_error':
@@ -181,10 +255,12 @@ class TaskEngine:
         try:
             with self.access_lock: background = path in self.background_hydrations
             download = self.backend.download if background else getattr(self.backend, 'download_for_open', self.backend.download)
-            download(path, expected, stage, LinkedCancellation(cancelled, self.cancel))
+            with work_priority('normal' if background else 'interactive'):
+                download(path, expected, stage, LinkedCancellation(cancelled, self.cancel))
             self._check_backend()
             if sha1(stage) != expected['sha1']: raise RemoteChanged('文件下载校验失败。')
             yield stage
+            self.activity.completed('download', path, expected, operation=stage.name)
         finally:
             stage.unlink(missing_ok=True)
 
@@ -205,14 +281,58 @@ class TaskEngine:
                 rel = relative_path(path.relative_to(self.root).as_posix())
                 if internal(rel): raise RuntimeError('本地文件使用了云端事务保留名称，请先改名。')
                 if rel == self.health_name: raise RuntimeError('本地文件占用了任务健康标记名称。')
-                st = placeholder_stat(path)
-                state = self.native.state(path)
-                if state and state['identity'].get('task') != self.task['id']:
-                    raise RuntimeError('文件属于其他同步任务。')
-                if not state and getattr(st, 'st_file_attributes', 0) & 0x400:
-                    raise RuntimeError('同步目录含非云文件重解析点。')
-                result[rel] = dict(kind='dir' if path.is_dir() else 'file', size=st.st_size,
-                                   mtime=st.st_mtime_ns, state=state, usn=self.native.usn(rel))
+                entry = self.inventory_entry(rel)
+                if entry is not None: result[rel] = entry
+        return result
+
+    def inventory_entry(self, relative):
+        """Fresh metadata only; never hydrate a placeholder to discover changes."""
+        if not self.root.is_dir() or self.root.stat().st_ino != self.state.get('local_root_id'):
+            raise RuntimeError('本地同步根丢失或身份变化，停止同步。')
+        rel = relative_path(relative)
+        if internal(rel) or rel == self.health_name:
+            raise RuntimeError('本地文件使用了同步保留名称，请先改名。')
+        path = self.native.path(rel)
+        try: st = placeholder_stat(path)
+        except FileNotFoundError: return None
+        state = self.native.state(path)
+        if state and state['identity'].get('task') != self.task['id']:
+            raise RuntimeError('文件属于其他同步任务。')
+        if not state and getattr(st, 'st_file_attributes', 0) & 0x400:
+            raise RuntimeError('同步目录含非云文件重解析点。')
+        import stat
+        return dict(kind='dir' if stat.S_ISDIR(st.st_mode) else 'file', size=st.st_size,
+                    mtime=st.st_mtime_ns, state=state, usn=self.native.usn(rel))
+
+    def refresh_inventory(self, previous, paths):
+        result = dict(previous)
+        roots = []
+        for raw in sorted(paths, key=lambda p: (p.count('/'), p.casefold())):
+            path = relative_path(raw)
+            if any(excluded(part) for part in path.split('/')): continue
+            if any(path == parent or path.startswith(parent+'/') for parent in roots): continue
+            roots.append(path)
+            for old in list(result):
+                if old.casefold() == path.casefold() or old.casefold().startswith(path.casefold()+'/'):
+                    result.pop(old)
+            value = self.inventory_entry(path)
+            if value is None: continue
+            result[path] = value
+            if value['kind'] == 'dir':
+                def failure(error): raise error
+                for parent, dirs, files in os.walk(self.native.path(path), followlinks=False, onerror=failure):
+                    dirs[:] = [x for x in dirs if not excluded(x)]
+                    for name in dirs+files:
+                        if excluded(name): continue
+                        rel = (Path(parent)/name).relative_to(self.root).as_posix()
+                        entry = self.inventory_entry(rel)
+                        if entry is not None: result[rel] = entry
+            ancestor = path.rpartition('/')[0]
+            while ancestor:
+                value = self.inventory_entry(ancestor)
+                if value is not None: result[ancestor] = value
+                ancestor = ancestor.rpartition('/')[0]
+        self.metrics['incremental_inventory_scans'] = self.metrics.get('incremental_inventory_scans', 0)+1
         return result
 
     def local_content(self, path, item):
@@ -272,7 +392,8 @@ class TaskEngine:
         stage = self.directory/'uploads'/stage_name
         if not stage.is_file() or stage.stat().st_size != pending['size'] or sha1(stage) != pending['sha1']:
             raise RuntimeError('上传恢复内容丢失或校验失败。')
-        remote = getattr(self.backend, 'recovery_snapshot', self.backend.snapshot)().get(path)
+        remote = (self.backend.recovery_entry(path) if hasattr(self.backend, 'recovery_entry') else
+                  getattr(self.backend, 'recovery_snapshot', self.backend.snapshot)().get(path))
         self._check_backend()
         wanted = ('file', pending['size'], pending['sha1'])
         transaction = getattr(self.backend, 'has_transaction', lambda _:False)(pending['stage'])
@@ -306,6 +427,7 @@ class TaskEngine:
         self.fault('upload_checkpoint')
         self.state['pending'] = None
         self.save()
+        self.activity.completed('upload', path, remote, operation=stage_name)
         self.fault('upload_complete')
         stage.unlink(missing_ok=True)
 
@@ -339,7 +461,9 @@ class TaskEngine:
             self.native.update_remote(path, self.identity(path, remote), local['usn'])
             self.fault('remote_refreshed')
             self.checkpoint(path, remote)
-            if keep: self.native.hydrate(path)
+            if keep:
+                self.native.hydrate(path)
+                self.activity.completed('download', path, remote, operation=stage.name)
         finally:
             with self.access_lock: self.prefetched.pop(key, None)
             stage.unlink(missing_ok=True)
@@ -347,10 +471,18 @@ class TaskEngine:
     def local_rename(self, local, remote):
         for path in sorted(local, key=lambda p: p.count('/')):
             if path in self.state.get('conflicts', {}): continue
-            state = local[path]['state']
+            hint = local[path].get('state')
+            if not hint or hint.get('identity', {}).get('path') == path: continue
+            fresh = self.inventory_entry(path)
+            if fresh is None:
+                local.pop(path, None)
+                continue
+            local[path] = fresh
+            state = fresh['state']
             if not state: continue
             old = state['identity'].get('path')
             if old == path or old not in self.state['items'] or old in local: continue
+            if self.inventory_entry(old) is not None: continue
             if path in remote: raise RemoteChanged('本地改名目标与云端文件冲突，保留双方。')
             expected = self.state['items'][old]['remote']
             if version(remote.get(old)) != version(expected):
@@ -389,6 +521,7 @@ class TaskEngine:
         self.state['items'].update(changes)
         self.state['pending'] = None
         self.save()
+        self.activity.completed('rename', new, rows.get(new))
 
     def check_batch(self, batch):
         self.metrics['last_batch'] = batch.number
@@ -396,26 +529,59 @@ class TaskEngine:
 
     def cycle(self, *, batch=None):
         if self.cancel.is_set(): raise InterruptedError()
+        started = time.monotonic()
+        self.more_work = False
         if not self.started: self.start()
         self.status('checking', '正在核对本地与云端文件')
+        if self.state.get('pending') and self.scan_complete:
+            self.scan_complete(True)  # Recovery may transfer a large staged file.
         self.recover_pending()
         remote = self.remote_snapshot(batch=batch)
-        # A watcher is only a scheduling hint. Reconcile against a fresh local
-        # inventory after the authoritative remote scan, never a cached deletion plan.
-        local = self.monitor.poll(force=True) if self.monitor else self.inventory()
+        # Event snapshots limit discovery work; each known path is revalidated
+        # below before any mutation. Overflow/restart still performs a full scan.
+        local = self.monitor.poll() if self.monitor else self.inventory()
+        if self.scan_complete: self.scan_complete(remote != self._last_remote or local != self._last_local)
         while self.local_rename(local, remote):
             remote, local = self.remote_snapshot(), self.inventory()
         changed = remote != self._last_remote or local != self._last_local
-        self._last_remote, self._last_local = copy.deepcopy(remote), copy.deepcopy(local)
+        previous_remote, previous_local = self._last_remote, self._last_local
         base = copy.deepcopy(self.state['items'])
-        removals = [p for p, row in base.items() if p not in local or p not in remote]
-        if len(removals) > 50:
-            raise RuntimeError('本轮删除超过 50 项，已停止任务并保留现有内容。')
         deferred_dirs = []
-        names = sorted(set(remote) | set(local) | set(base), key=lambda p: (p.count('/'), p.casefold()))
-        for path in names:
+        self._delete_done = 0
+        self._delete_total = sum(1 for path, row in base.items() if row['remote']['kind']=='file'
+            and ((path not in local and version(remote.get(path)) == version(row['remote']))
+                 or (path not in remote and path in local)))
+        all_names = set(remote) | set(local) | set(base)
+        if previous_remote is None or previous_local is None:
+            dirty = all_names
+        else:
+            dirty = {p for p in all_names if remote.get(p) != previous_remote.get(p) or local.get(p) != previous_local.get(p)}
+            # The last observed snapshots precede our own creates/uploads. An
+            # immediate user deletion may therefore equal that old absence.
+            # Existing baselines missing on either side always need resolution.
+            dirty.update(p for p in base if p not in remote or p not in local)
+        # Newly created/edited local files precede a bulk deletion backlog.
+        names = sorted(dirty, key=lambda p: (p.count('/'), 0 if p in local and (previous_local is None or local.get(p) != previous_local.get(p)) else 1, p.casefold()))
+        processed = set()
+        polled_at = time.monotonic()
+        for number, path in enumerate(names):
+            if number and self.monitor and (number % 8 == 0 or time.monotonic()-polled_at >= .25):
+                latest = self.monitor.poll()
+                polled_at = time.monotonic()
+                incoming = {p for p in set(latest) | set(local) if latest.get(p) != local.get(p) and
+                    (p not in processed or latest.get(p) and (not latest[p].get('state') or latest[p]['state'].get('modified')))}
+                if incoming:
+                    # All completed operations already have durable checkpoints.
+                    # Keep the old comparison snapshots so unfinished work is retried.
+                    self.more_work = True
+                    self.status('checking', '检测到新文件，正在优先安排',
+                                progress=dict(phase='queued', wait_reason='new_local_files'))
+                    return True
+            processed.add(path)
             if self.cancel.is_set(): raise InterruptedError()
-            r, l = remote.get(path), local.get(path)
+            r, l = remote.get(path), self.inventory_entry(path)
+            if l is None: local.pop(path, None)
+            else: local[path] = l
             b = base.get(path, {}).get('remote')
             kinds = {x['kind'] for x in (r, l, b) if x}
             if len(kinds) > 1: raise RuntimeError('同一路径的文件与文件夹发生冲突，请先处理。')
@@ -456,19 +622,23 @@ class TaskEngine:
                     self.checkpoint(path, r)
             elif r:
                 if b and version(r) == version(b):
+                    self.deleting(path)
                     self.backend.delete(path, r)
                     self.state['items'].pop(path, None); self.save()
+                    self.deleted(path, r)
                 else:
                     self.native.create(path, self.identity(path, r))
                     self.fault('placeholder_created')
                     self.checkpoint(path, r)
             elif l:
                 if b and lc == bc:
+                    self.deleting(path)
                     self.backend.expect(path, None)
                     self._check_backend()
                     self.native.remove(path, l['usn'])
                     self.fault('local_deleted')
                     self.state['items'].pop(path, None); self.save()
+                    self.deleted(path, b)
                 else: self.upload(path, None)
             else:
                 self.state['items'].pop(path, None); self.save()
@@ -480,14 +650,42 @@ class TaskEngine:
                 self._check_backend()
                 self.native.remove(path, self.native.usn(path))  # Also refuses nonempty directories.
             self.state['items'].pop(path, None); self.save()
-        self.apply_policies()
+        self.apply_policies(paths=dirty)
+        self.metrics['reconciled_items'] = self.metrics.get('reconciled_items', 0)+len(names)
+        self._last_remote, self._last_local = copy.deepcopy(remote), copy.deepcopy(local)
         self.metrics['cycles'] += 1
+        self.metrics['cycle_seconds'] = round(time.monotonic()-started, 3)
+        if hasattr(self.backend, 'metrics'): self.metrics['backend'] = dict(self.backend.metrics)
+        if self.state_store is not None:
+            self.state_store.export()
+            self.metrics['state_store'] = dict(self.state_store.metrics)
         self.status('idle', '本轮文件核对完成', files=len(self.state['items']), last_check_at=time.time(), metrics=dict(self.metrics))
         return changed
 
-    def apply_policies(self):
+    def deleting(self, path):
+        self.status('syncing', '正在同步删除', file=path,
+                    progress=dict(phase='deleting', name=path, completed=self._delete_done,
+                                  total=max(self._delete_total, self._delete_done+1)))
+
+    def deleted(self, path, remote):
+        self._delete_done += 1
+        self.activity.completed('deleted', path, remote)
+        self.status('syncing', '已同步删除', file=path,
+                    progress=dict(phase='deleting', name=path, completed=self._delete_done,
+                                  total=max(self._delete_total, self._delete_done)))
+
+    def apply_policies(self, paths=None):
         now = time.time()
+        key = (self.task.get('policy'), self.task.get('cache_hours'), tuple(sorted(self.task.get('overrides', {}).items())))
+        policy_changed = key != self._policy_key
+        eligible = None if paths is None or policy_changed else set(paths)
+        if eligible is not None:
+            with self.access_lock: eligible.update(self.access)
+            for path, row in self.state['items'].items():
+                if row.get('applied_pin') != 1 and now-row.get('last_access', now) >= self.task['cache_hours']*3600:
+                    eligible.add(path)
         for path, row in sorted(self.state['items'].items(), key=lambda pair: pair[0].count('/')):
+            if eligible is not None and path not in eligible: continue
             if not self.native.path(path).exists(): continue
             state = self.native.state(self.native.path(path))
             if not state: continue
@@ -532,3 +730,4 @@ class TaskEngine:
                 self.native.dehydrate(path)
                 self.fault('dehydrated')
         self.save()
+        self._policy_key = key

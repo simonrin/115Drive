@@ -8,7 +8,7 @@ import types
 import unittest
 from unittest.mock import patch
 
-from task_scheduling import BatchCoordinator, CheckBatch
+from task_scheduling import BatchCoordinator, CheckBatch, AccountChecks
 from task_backend import OpenListBackend, RemoteChanged
 from task_service import TaskManager
 from sync_tasks import TaskStore
@@ -142,7 +142,7 @@ class BatchBackendTests(unittest.TestCase):
         self.host.bad=False
         original=self.host.api
         self.host.api=lambda *args:{'content':[]}
-        with self.assertRaises(RemoteChanged):self.one.batch_snapshot(self.batch)
+        with self.assertRaises(RemoteChanged):self.one.snapshot(batch=self.batch,transport=True)
         self.host.api=original
         self.assertIn('branch/file.bin',self.two.batch_snapshot(self.batch))
 
@@ -176,7 +176,7 @@ class ManagerTests(unittest.TestCase):
                 store.mutate('resume',dict(revision=store.read()['revision'],id=task['id']))
             from test_task_runtime import FakeEngine
             manager=TaskManager(types.SimpleNamespace(ROOT=root),backend_factory=lambda *args:None,engine_factory=FakeEngine,shell=False)
-            manager.batches=BatchCoordinator(window=.15)
+            manager.batches=AccountChecks()
             reads=[];original=manager.store.read
             def read():reads.append(1);return original()
             manager.store.read=read

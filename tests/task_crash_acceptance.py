@@ -8,7 +8,9 @@ from runtime_json import atomic_write_json
 
 def engine(run, fault=None):
     task=json.loads((run/'task.json').read_text(encoding='utf-8'))
-    return TaskEngine(task,run/'state',LocalBackend(run/'remote'),fault=fault)
+    value = TaskEngine(task,run/'state',LocalBackend(run/'remote'),fault=fault)
+    value.enable_state_store()
+    return value
 
 def worker(run,point):
     def stop(step):

@@ -93,6 +93,7 @@ namespace TwoDrive {
    Find<Button>("CloseButton").Click+=(s,e)=>panel.Hide();
    Find<Button>("FolderButton").Click+=(s,e)=>LaunchFolder();
    Find<Button>("SettingsButton").Click+=(s,e)=>OpenSettings();
+   Find<Button>("IssuesButton").Click+=(s,e)=>OpenSyncIssues();
    Find<Button>("SyncButton").Click+=(s,e)=>Send("sync-now");
    Find<Button>("PauseButton").Click+=(s,e)=>Send(PauseCommand());
    notify=new Forms.NotifyIcon();
@@ -138,7 +139,7 @@ namespace TwoDrive {
    if(File.Exists(Path.Combine(root,"runtime/private/folder-change-active.json"))) {
     model["state"]="relocating";model["message"]=Text(Read("runtime/folder-change.json"),"message","正在更改同步文件夹，请稍候。");
    }
-   Render(model,tasks?new Dictionary<string,object>():Read("runtime/progress.json"),tasks?new object[0]:ReadAny("runtime/activity.json"));
+   Render(model,Read(tasks?"runtime/tasks-progress.json":"runtime/progress.json"),ReadAny(tasks?"runtime/tasks-activity.json":"runtime/activity.json"));
   }
 
   void Render(Dictionary<string,object> model,Dictionary<string,object> progress,object recent) {
@@ -192,10 +193,16 @@ namespace TwoDrive {
     int count=(int)Number(model,"active_tasks"),pausedCount=(int)Number(model,"paused_tasks");
     title=mode=="idle"?count+" 个任务已同步"+(pausedCount>0?" · "+pausedCount+" 个已暂停":""):mode=="paused"?"全部任务已暂停":mode=="stopping"?"正在暂停全部任务":mode=="error"?"部分任务需要处理":count+" 个任务正在同步";
     detail=Text(model,"message");
+    var taskProgress=Rows(Value(progress,"active")).ToList();
+    if(taskProgress.Count>0) {
+     if(active && !problem && mode!="stopping")title=TaskProgressTitle(taskProgress[0]);
+     detail+="\n"+String.Join("\n",taskProgress.Select(TaskProgressDetail));
+    }
    }
    Label("StatusTitle").Text=title;Label("StatusSymbol").Text=symbol;
    Label("StatusSymbol").Foreground=Brush(ink);Label("StatusTitle").Foreground=Brush("#243247");
    Find<Border>("StatusCard").Background=problem?Brush(color):Brushes.Transparent;
+   Find<Button>("IssuesButton").Visibility=problem?Visibility.Visible:Visibility.Collapsed;
    Label("StatusTitle").ToolTip=new TextBlock{Text=title+"\n"+detail,TextWrapping=TextWrapping.Wrap,MaxWidth=360};
    bool spin=active && !problem && symbol=="↻" && SystemParameters.ClientAreaAnimation;
    if(spin!=statusSpinning) {
@@ -219,17 +226,40 @@ namespace TwoDrive {
    Find<Button>("PauseButton").IsEnabled=!sending && mode!="stopping" && mode!="relocating";
    Find<Button>("SyncButton").IsEnabled=!sending && mode!="relocating" && mode!="stopping";
    var visible=Rows(recent).Reverse().Where(row=>Text(row,"action")!="backup").Take(20).ToList();
+   RefreshActivityTasks();
    string local=ActivityLocalRoot();
-   string serialized=json.Serialize(visible)+local+DateTime.Now.ToString("yyyyMMddHHmm")+String.Join("|",visible.Select(row=>DescribeActivity(row,local).Status));
+   string serialized=json.Serialize(visible)+local+json.Serialize(activityTaskRoots)+DateTime.Now.ToString("yyyyMMddHHmm")+String.Join("|",visible.Select(row=>DescribeActivity(row,ActivityLocalRoot(row)).Status));
    if(serialized!=lastActivities && activityMenu==null){lastActivities=serialized;RenderActivities(visible);}
    if(!test)try {Save("runtime/tray-session.json",new{pid=Process.GetCurrentProcess().Id,updated_at=DateTimeOffset.Now.ToString("o"),icon_visible=notify.Visible,panel_visible=panel.IsVisible,title=title,worker_running=WorkerExists()});}catch{}
   }
 
+  string TaskProgressTitle(Dictionary<string,object> row) {
+   string phase=Text(row,"phase"),label=phase=="deleting"?"正在同步删除":phase=="renaming"?"正在同步改名":
+    phase=="uploading"?"正在上传":phase=="downloading"?"正在下载":phase=="verifying"?"正在核验":
+    phase=="waiting_network"?"正在等待网络":phase=="waiting_rate"?"正在等待请求额度":phase=="queued"?"等待检查":
+    phase=="preparing"?"正在连接":phase=="resuming"?"正在续传":"正在检查";
+   string task=Text(row,"task_name"),result=(String.IsNullOrEmpty(task)?"":task+" · ")+label;
+   if(Number(row,"total")>0)result+=" "+Number(row,"completed").ToString("0")+"/"+Number(row,"total").ToString("0");
+   else if(Number(row,"size")>0 && Object.Equals(Value(row,"progress_confirmed"),true))
+    result+=" · "+Math.Min(100,100*Number(row,"bytes")/Number(row,"size")).ToString("0",CultureInfo.InvariantCulture)+"%";
+   return result;
+  }
+  string TaskProgressDetail(Dictionary<string,object> row) {
+   string result=TaskProgressTitle(row),name=Text(row,"name"),wait=Text(row,"wait_reason");
+   if(!String.IsNullOrEmpty(name))result+="\n"+name;
+   if(!String.IsNullOrEmpty(wait))result+="\n"+wait;
+   var scan=Map(Value(row,"scan"));
+   if(Number(scan,"directories")>0)result+="\n已检查 "+Number(scan,"directories").ToString("0")+" 个目录，"+Number(scan,"entries").ToString("0")+" 项";
+   if(Number(row,"size")>0 && Object.Equals(Value(row,"progress_confirmed"),true))result+="\n"+Bytes(Number(row,"bytes"))+" / "+Bytes(Number(row,"size"));
+   if(Number(row,"speed")>0)result+=" · "+Bytes(Number(row,"speed"))+"/s";
+   return result;
+  }
+
   void RenderActivities(IEnumerable<Dictionary<string,object>> rows) {
    var list=Find<StackPanel>("ActivityList");list.Children.Clear();
-   string local=ActivityLocalRoot();
+   RefreshActivityTasks();
    foreach(var item in rows.Where(row=>Text(row,"action")!="backup")) {
-    var description=DescribeActivity(item,local);
+    var description=DescribeActivity(item,ActivityLocalRoot(item));
     var grid=new Grid();
     grid.ColumnDefinitions.Add(new ColumnDefinition{Width=new GridLength(46)});grid.ColumnDefinitions.Add(new ColumnDefinition());
     var badge=new Border{Width=34,Height=44,VerticalAlignment=VerticalAlignment.Center,HorizontalAlignment=HorizontalAlignment.Left};
@@ -239,7 +269,7 @@ namespace TwoDrive {
     var stack=new StackPanel();Grid.SetColumn(stack,1);
     stack.Children.Add(new TextBlock{Text=FileLabel(Text(item,"name")),ToolTip=Text(item,"name"),Foreground=Brush("#243247"),FontSize=12,TextTrimming=TextTrimming.CharacterEllipsis});
     var destination=new TextBlock{Foreground=Brush("#596779"),FontSize=11,Margin=new Thickness(0,3,0,0),TextTrimming=TextTrimming.CharacterEllipsis};
-    destination.Inlines.Add(new Run(description.Status));
+    destination.Inlines.Add(new Run((String.IsNullOrEmpty(Text(item,"task_name"))?"":Text(item,"task_name")+" · ")+description.Status));
     if(!String.IsNullOrEmpty(description.Folder))destination.Inlines.Add(new Run(" "+description.Folder){Foreground=Brush(CloudBrand.Indigo)});
     stack.Children.Add(destination);
     stack.Children.Add(new TextBlock{Text=ActivityTime(Text(item,"time")),Foreground=Brush("#667385"),FontSize=10,Margin=new Thickness(0,2,0,0)});
@@ -380,6 +410,10 @@ namespace TwoDrive {
     Render(Map(Value(fixture,"paused")),new Dictionary<string,object>(),Value(fixture,"activity"));
     Find<Button>("PauseButton").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));if(lastCommand!="resume")throw new Exception("Resume action mismatch");passed.Add("resume_button");Capture("tray-preview-paused.png");
     Render(Map(Value(fixture,"error")),new Dictionary<string,object>(),Value(fixture,"activity"));if(Label("StatusTitle").Text!="同步遇到问题")throw new Exception("Error hidden");passed.Add("error_state");Capture("tray-preview-error.png");
+    if(Find<Button>("IssuesButton").Visibility!=Visibility.Visible)throw new Exception("Error has no visible action");
+    Find<Button>("IssuesButton").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+    if(settings==null||!settings.IsVisible||SF<StackPanel>("SyncPage").Visibility!=Visibility.Visible)throw new Exception("Issue action did not open sync settings");
+    settings.Close();panel.Show();focusTaskIssues=false;passed.Add("error_action_opens_sync_settings");
     var retry=new Dictionary<string,object>{{"state","retrying"},{"message","网络连接暂时不可用"},{"retry_seconds",30},{"retry_at",DateTimeOffset.Now.AddSeconds(30).ToString("o")}};
     Render(retry,resumeProgress,Value(fixture,"activity"));panel.UpdateLayout();
     if(!Label("StatusTitle").Text.Contains("00:30 后重试") || Label("PauseLabel").Text!="暂停同步" || Find<Border>("StatusCard").ActualHeight!=statusHeight)throw new Exception("Retry countdown or fixed row mismatch");
@@ -399,6 +433,7 @@ namespace TwoDrive {
     Render(Map(Value(fixture,"idle")),new Dictionary<string,object>(),Value(fixture,"activity"));panel.UpdateLayout();
     if(Find<Border>("StatusCard").ActualHeight!=statusHeight || statusSpinning || statusRotation.HasAnimatedProperties)throw new Exception("Idle status height or animation mismatch");
     passed.Add("idle_same_height_and_animation_stops");Capture("tray-preview-idle.png");
+    if(Find<Button>("IssuesButton").Visibility!=Visibility.Collapsed)throw new Exception("Resolved issue action still visible");
     var timeState=new Dictionary<string,object>{{"state","idle"},{"last_check_at",DateTimeOffset.Now.ToString("o")},{"last_sync_at",DateTimeOffset.Now.AddHours(-1).ToString("o")},{"last_transfer_at",DateTimeOffset.Now.AddHours(-2).ToString("o")}};
     Render(timeState,new Dictionary<string,object>(),Value(fixture,"activity"));panel.UpdateLayout();
     string timeDetail=Convert.ToString(Label("LastSyncLabel").ToolTip);
@@ -415,7 +450,25 @@ namespace TwoDrive {
     Render(new Dictionary<string,object>{{"state","idle"},{"task_mode",true},{"task_count",6},{"active_tasks",5},{"paused_tasks",1}},new Dictionary<string,object>(),null);
     if(Label("StatusTitle").Text!="5 个任务已同步 · 1 个已暂停")throw new Exception("Paused tasks incorrectly reported as synced");
     passed.Add("paused_tasks_not_reported_as_synced");
+    var taskModel=new Dictionary<string,object>{{"state","syncing"},{"task_mode",true},{"task_count",6},{"active_tasks",6},{"message","6 个任务运行中"}};
+    var taskOperation=new Dictionary<string,object>{{"task_id","pictures"},{"task_name","图片"},{"phase","deleting"},{"name","截图/示例.png"},{"completed",18},{"total",75}};
+    var taskProgress=new Dictionary<string,object>{{"active",new object[]{taskOperation}}};
+    Render(taskModel,taskProgress,null);panel.UpdateLayout();
+    if(Label("StatusTitle").Text!="图片 · 正在同步删除 18/75" || Find<Border>("StatusCard").ActualHeight!=statusHeight)throw new Exception("Task deletion progress hidden or changed row height");
+    if(!((TextBlock)Label("StatusTitle").ToolTip).Text.Contains("截图/示例.png"))throw new Exception("Task operation file missing from details");
+    passed.Add("task_actual_delete_counts_and_file_visible");Capture("tray-preview-task-delete.png");
+    taskOperation["phase"]="waiting_network";taskOperation["wait_reason"]="等待云端响应";
+    Render(taskModel,taskProgress,null);
+    if(!Label("StatusTitle").Text.Contains("正在等待网络") || !((TextBlock)Label("StatusTitle").ToolTip).Text.Contains("等待云端响应"))throw new Exception("Task wait reason missing");
+    passed.Add("task_network_wait_is_distinct_from_scanning");
+    taskOperation["phase"]="uploading";taskOperation.Remove("total");taskOperation.Remove("completed");taskOperation["size"]=100;taskOperation["bytes"]=75;
+    Render(taskModel,taskProgress,null);
+    if(Label("StatusTitle").Text.Contains("75%"))throw new Exception("Unconfirmed task bytes shown as confirmed");
+    taskOperation["progress_confirmed"]=true;Render(taskModel,taskProgress,null);
+    if(!Label("StatusTitle").Text.Contains("75%"))throw new Exception("Confirmed task bytes hidden");
+    passed.Add("task_transfer_percentage_requires_confirmed_progress");
     TestActivityActions(passed);
+    TestTaskActivityActions(passed);
     RenderActivities(Rows(Value(fixture,"activity")).Reverse());
     Find<Button>("SyncButton").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));if(lastCommand!="sync-now")throw new Exception("Sync action mismatch");passed.Add("sync_now_button");
     TogglePanel();if(panel.IsVisible)throw new Exception("Second tray click did not hide panel");passed.Add("second_click_hides_panel");

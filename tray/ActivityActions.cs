@@ -13,6 +13,18 @@ using Forms=System.Windows.Forms;
 
 namespace TwoDrive {
  sealed partial class TrayApp {
+  [StructLayout(LayoutKind.Sequential)] struct ActivityAttributeTag { public uint Attributes,Tag; }
+  [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true,EntryPoint="CreateFileW")]
+  static extern Microsoft.Win32.SafeHandles.SafeFileHandle ActivityOpenMetadata(string path,uint access,uint sharing,IntPtr security,uint mode,uint flags,IntPtr template);
+  [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetFileInformationByHandleEx(Microsoft.Win32.SafeHandles.SafeFileHandle handle,int info,out ActivityAttributeTag data,uint size);
+  static bool CloudTag(uint tag) {return (tag&0xFFFF0FFFu)==0x9000001Au;}
+  static bool CloudReparsePoint(string path) {
+   // Read the tag without following the reparse point or fetching cloud contents.
+   using(var handle=ActivityOpenMetadata(path,0,7,IntPtr.Zero,3,0x02200000,IntPtr.Zero)) {
+    ActivityAttributeTag tag;
+    return !handle.IsInvalid && GetFileInformationByHandleEx(handle,9,out tag,(uint)Marshal.SizeOf(typeof(ActivityAttributeTag))) && CloudTag(tag.Tag);
+   }
+  }
   static bool InFolder(string path,string folder) {
    return path.Equals(folder,StringComparison.OrdinalIgnoreCase)||path.StartsWith(folder+Path.DirectorySeparatorChar,StringComparison.OrdinalIgnoreCase);
   }
@@ -28,7 +40,7 @@ namespace TwoDrive {
     if(!InFolder(path,local))return null;
     // A history entry must not turn into a URL, shell argument or junction escape.
     for(string parent=path;parent!=null && InFolder(parent,local);parent=Path.GetDirectoryName(parent)) {
-     if((File.Exists(parent)||Directory.Exists(parent))&&(File.GetAttributes(parent)&FileAttributes.ReparsePoint)!=0)return null;
+     if((File.Exists(parent)||Directory.Exists(parent))&&(File.GetAttributes(parent)&FileAttributes.ReparsePoint)!=0 && !CloudReparsePoint(parent))return null;
     }
     return path;
    }catch{return null;}
@@ -47,6 +59,24 @@ namespace TwoDrive {
    public string File,Folder,Message;
   }
   string ActivityLocalRoot() {return test&&!String.IsNullOrEmpty(activityTestRoot)?activityTestRoot:Text(Read("config.json"),"local_path");}
+  Dictionary<string,string> activityTaskRoots=new Dictionary<string,string>(StringComparer.Ordinal);
+  bool activityTaskTest;
+  void RefreshActivityTasks() {
+   if(test && activityTaskTest)return;
+   var current=new Dictionary<string,string>(StringComparer.Ordinal);
+   foreach(var task in Rows(Value(Read("runtime/private/sync-tasks.json"),"tasks"))) {
+    string id=Text(task,"id"),local=Text(task,"local_path");
+    if(!String.IsNullOrEmpty(id) && Path.IsPathRooted(local))current[id]=local;
+   }
+   activityTaskRoots=current;
+  }
+  string ActivityLocalRoot(Dictionary<string,object> item) {
+   string id=Text(item,"task_id"),local;
+   if(!String.IsNullOrEmpty(id))return activityTaskRoots.TryGetValue(id,out local)?local:"";
+   // A task event without a trusted task identity must never open a legacy file.
+   if(Value(item,"local_root")!=null || Object.Equals(Value(state,"task_mode"),true))return "";
+   return ActivityLocalRoot();
+  }
   sealed class ActivityPresentation {
    public string Status,Folder;
   }
@@ -90,7 +120,8 @@ namespace TwoDrive {
   }
   ActivityTarget ResolveActivity(Dictionary<string,object> item) {
    var result=new ActivityTarget{Message="文件已移动或删除，本机原位置没有可打开的文件。可右键打开仍存在的上级文件夹。"};
-   string local=ActivityLocalRoot(),name=Text(item,"name"),path=ActivityPath(local,name);
+   RefreshActivityTasks();
+   string local=ActivityLocalRoot(item),name=Text(item,"name"),path=ActivityPath(local,name);
    if(path==null){result.Message="这条活动无法定位到同步文件夹中的文件。";return result;}
    if(File.Exists(path))result.File=path;
    if(result.File!=null)result.Folder=Path.GetDirectoryName(result.File);
@@ -135,6 +166,7 @@ namespace TwoDrive {
   }
 
   void TestActivityActions(List<string> passed) {
+   state=new Dictionary<string,object>();
    string fixture=Path.Combine(root,"runtime","activity-ui-test-"+Guid.NewGuid().ToString("N"));
    activityTestRoot=Path.Combine(fixture,"local");
    string relative="资料 子目录/hello,测试.txt";
@@ -187,6 +219,27 @@ namespace TwoDrive {
    if(lastActivityTarget!=moved)throw new Exception("Activity row retained the old sync root");
    passed.Add("activity_click_uses_current_sync_folder");
    activityTestRoot="";lastActivities=""; // Restore real configuration and redraw on next render.
+  }
+
+  void TestTaskActivityActions(List<string> passed) {
+   string fixture=Path.Combine(root,"runtime","task-activity-test-"+Guid.NewGuid().ToString("N"));
+   string first=Path.Combine(fixture,"first"),second=Path.Combine(fixture,"second");
+   Directory.CreateDirectory(first);Directory.CreateDirectory(second);
+   File.WriteAllText(Path.Combine(first,"same.txt"),"First task");File.WriteAllText(Path.Combine(second,"same.txt"),"Second task");
+   activityTaskTest=true;
+   try {
+    activityTaskRoots=new Dictionary<string,string>{{"task-a",first},{"task-b",second}};
+    var item=new Dictionary<string,object>{{"task_id","task-b"},{"task_name","图片"},{"local_root",first},{"name","same.txt"},{"action","download"}};
+    OpenActivity(item,false);
+    if(lastActivityTarget!=Path.Combine(second,"same.txt"))throw new Exception("Task activity opened a different task root");
+    passed.Add("task_activity_uses_current_config_not_event_root");
+    activityTaskRoots.Remove("task-b");OpenActivity(item,false);
+    if(lastCommand!="activity-unavailable")throw new Exception("Removed task activity opened another root");
+    passed.Add("removed_task_activity_does_not_fall_back_to_legacy_root");
+    foreach(uint tag in new uint[]{0x9000001A,0x9000101A,0x9000F01A})if(!CloudTag(tag))throw new Exception("Native cloud reparse tag rejected");
+    foreach(uint tag in new uint[]{0xA0000003,0xA000000C,0x8000001B,0})if(CloudTag(tag))throw new Exception("Unsafe reparse tag permitted");
+    passed.Add("activity_cloud_tag_allowlist_excludes_junctions_and_symlinks");
+   } finally {activityTaskTest=false;RefreshActivityTasks();lastActivities="";}
   }
  }
 }
