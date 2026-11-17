@@ -22,7 +22,7 @@ def main():
     args=parser.parse_args();work=args.work.resolve();work.mkdir(parents=True,exist_ok=False)
     app=work/'原有 程序';app.mkdir();local=work/'本机文件';local.mkdir()
     with zipfile.ZipFile(args.old_portable) as archive:archive.extractall(app)
-    write(app/'config.json',dict(legacy_enabled=False,recovery_enabled=False,start_with_windows=False,local_path=str(local),remote_path='cloud115:115Drive'))
+    write(app/'config.json',dict(legacy_enabled=False,recovery_enabled=False,cloud_history_mode='recycle',start_with_windows=False,local_path=str(local),remote_path='cloud115:115Drive'))
     task_ids=[uuid.uuid4().hex for _ in range(6)]
     write(app/'runtime/private/sync-tasks.json',dict(version=1,revision=41,tasks=[dict(id=task_ids[i],account='115',name='目录'+str(i),local_path=str(work/('同步'+str(i))),cloud_path='/目录'+str(i),policy='online_only' if i%2 else 'always_keep',paused=bool(i%3),cache_hours=24,overrides={'子目录':'online_only'}) for i in range(6)]))
     for name in ('runtime/private/initialized.json','runtime/private/admin.json','runtime/private/rclone.conf','runtime/private/bisync/old.path1.lst','runtime/private/bisync/old.path2.lst','runtime/private/transfer-resume/saved.part','tray/settings.json','filters.txt','filters.txt.md5','保留此文件.txt','logs/history.log','recovery/previous.txt'):

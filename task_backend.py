@@ -20,7 +20,7 @@ from task_scheduling import METADATA, TRANSFERS
 from task_names import local_name, remote_relative, excluded
 from remote_manifest import RecursiveManifest, ManifestUnavailable, ancestry_matches
 from runtime_json import atomic_write_json
-from cloud_history import CloudHistory
+from cloud_history import CloudHistory, CloudRecycle, history_mode
 
 
 def sha1(path):
@@ -136,6 +136,7 @@ same name or an account switch cannot silently establish a new baseline.
     def __init__(self, task, host, *, read_only=False):
         self.t, self.task = host, task
         self.read_only = read_only
+        self.history_mode = history_mode(host)
         self.remote = task['cloud_path'].lstrip('/')
         self.identity = None
         self.account_key = None
@@ -449,15 +450,16 @@ same name or an account switch cannot silently establish a new baseline.
             self.connect()
             try:
                 result = self.transaction_upload(relative, Path(source), expected, cancelled)
-                operation = self.last_operation_id
-                tx = json.loads((self.journal_dir/(operation+'.json')).read_text(encoding='utf-8'))
-                if tx.get('expected') and tx.get('committed') and tx.get('archived'):
-                    self._history_known[operation] = tx
-                    self._history_pending[operation] = tx['archive']
-                return result
             except ConcurrentChange:
                 self.abort_transaction(self.last_operation_id)
                 raise
+            operation = self.last_operation_id
+            tx = json.loads((self.journal_dir/(operation+'.json')).read_text(encoding='utf-8'))
+            if tx.get('expected') and tx.get('committed') and tx.get('archived'):
+                self._history_known[operation] = tx
+                self._history_pending[operation] = tx['archive']
+                if self.history_mode == 'recycle': self.migrate_delete_history([operation])
+            return result
 
     @contextlib.contextmanager
     def transaction_scope(self, relative):
@@ -560,11 +562,12 @@ same name or an account switch cannot silently establish a new baseline.
             atomic_write_json(self.journal_dir/(operation + '.json'), tx, indent=2, durable=True)
             self.transaction_fault('before_remote_delete')
             if expected['kind'] == 'dir': self._assert_empty_directory(relative, expected)
+            self.history_handler(operation).prepare(operation)
             rows = self.rename_identity(relative, target, expected)
             self._history_known[operation] = tx
             self._history_pending[operation] = target
             result = self.migrate_delete_history([operation])[operation]
-            if result['stage'] != 'moved':
+            if result['stage'] not in ('moved', 'recycled'):
                 self._history_pending[operation] = target
                 reason = '删除归档在移入历史区前变化，已保留内容和处理记录。'
                 CloudHistory(self).conflict(operation, tx, reason)
@@ -574,6 +577,16 @@ same name or an account switch cannot silently establish a new baseline.
 
     def history_archive_info(self, operation_id):
         return CloudHistory(self).info(operation_id)
+
+    def history_handler(self, operation):
+        history = CloudHistory(self)
+        receipt = history.info(operation)
+        # Complete uncertain old cross-root moves with their original protocol.
+        # Once recycling starts, its durable receipt also survives mode changes.
+        if receipt and receipt.get('disposition') == 'recycle': return CloudRecycle(self)
+        if receipt and receipt.get('history_root_id'):
+            return history
+        return CloudRecycle(self) if self.history_mode == 'recycle' else history
 
     def _history_journals(self):
         for path in self.journal_dir.glob('*.json'):
@@ -591,7 +604,7 @@ same name or an account switch cannot silently establish a new baseline.
         for operation, tx in self._history_known.items():
             receipt = history.info(operation)
             if receipt:
-                if receipt['stage'] != 'moved':
+                if receipt['stage'] not in ('moved', 'recycled'):
                     self._history_pending[operation] = receipt['actual_source_archive']
                 continue
             actual = positions.get(tx['expected']['id'])
@@ -636,7 +649,7 @@ same name or an account switch cannot silently establish a new baseline.
             if limit is not None: operation_ids = list(operation_ids)[:limit]
             results = {}
             for operation in operation_ids:
-                history = CloudHistory(self)
+                history = self.history_handler(operation)
                 history.receipt_path(operation)  # Validate before opening a journal path.
                 tx = json.loads((self.journal_dir/(operation+'.json')).read_text(encoding='utf-8'))
                 if not (tx.get('kind') == 'delete' or (tx.get('committed') and tx.get('archived'))):
@@ -645,7 +658,7 @@ same name or an account switch cannot silently establish a new baseline.
                 with self.transaction_scope(actual):
                     result = history.archive(operation, tx, actual_archive=actual)
                 results[operation] = result
-                if result['stage'] in ('moved', 'not_archived'): self._history_pending.pop(operation, None)
+                if result['stage'] in ('moved', 'recycled', 'not_archived'): self._history_pending.pop(operation, None)
             return results
 
     def _all_children(self, relative, expected):

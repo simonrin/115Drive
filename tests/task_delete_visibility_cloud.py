@@ -92,6 +92,7 @@ def main():
     (run/'script-source.py').write_bytes(Path(__file__).read_bytes())
     private = run/'private'
     private.mkdir()
+    atomic_write_json(private/'config.json', dict(cloud_history_mode='retain'), durable=True)
     cloud = '/.twodrive-delete-visibility-' + run_id
     owner_name = 'fixture-owner-' + run_id + '.txt'
     owner = run/'owner.txt'
@@ -127,6 +128,7 @@ def main():
 
     class FixtureHost:
         PRIVATE = private
+        CONFIG = private/'config.json'
         RCLONE_CONF = real_host.PRIVATE/'rclone.conf'
 
         def __getattr__(self, name):
@@ -437,6 +439,39 @@ def main():
         operation = delete_operation(native, 'local-delete.png')
         archived = archive(native, operation, old, 'local-delete')
         passed(CHECKS[1], **archived)
+
+        # Move only the fixture-owned history root, reproducing the missing
+        # registered path without deleting retained content. A rejected delete
+        # must leave the source visible under its original name and identity.
+        registry = json.loads((private/'cloud-history'/native.account_key/'root.json').read_bytes())
+        history = registry['root']
+        owned = next(record for record in manifest['roots'] if record['id'] == history['id'])
+        probe = backend(owned['path'])
+        probe.connect()
+        assert probe.root_id == history['id']
+        expect_raw(probe, owner_name, owned['marker_identity'])
+        renamed = False
+        try:
+            probe.post_identity('files/batch_rename', {'fid':history['id'], 'file_name':history['name']+'-moved',
+                                'files_new_name['+history['id']+']':history['name']+'-moved'})
+            renamed = True
+            rejected = False
+            try:
+                native.delete('cloud-delete.png', remote_delete)
+            except RuntimeError as error:
+                assert '回收站恢复原目录' in str(error), str(error)
+                rejected = True
+            assert rejected, 'A missing history root did not stop the delete'
+            expect_raw(native, 'cloud-delete.png', remote_delete)
+            assert not any(name.startswith('_twodrive-deleted-') for name in raw(native))
+        finally:
+            if renamed:
+                probe.post_identity('files/batch_rename', {'fid':history['id'], 'file_name':history['name'],
+                                    'files_new_name['+history['id']+']':history['name']})
+                restored = backend(owned['path']); restored.connect()
+                assert restored.root_id == history['id']
+                expect_raw(restored, owner_name, owned['marker_identity'])
+        passed('missing_history_root_rejects_delete_without_renaming_source', source_id=remote_delete['id'])
         initial_moves = moves_for(old['id'])
         engine.cycle()
         assert moves_for(old['id']) == initial_moves

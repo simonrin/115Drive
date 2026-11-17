@@ -142,6 +142,12 @@ class BackendBulkTests(Fixture):
         super().setUp()
         self.backend = OpenListBackend(dict(id='a'*32, cloud_path='/test'), self.host)
         self.backend.post_identity = self.host.post
+        # This provider model covers source-manifest guards only. Destination
+        # preparation/relocation use the full model in test_cloud_history.
+        from unittest.mock import patch
+        preparation = patch('cloud_history.CloudHistory.prepare')
+        preparation.start()
+        self.addCleanup(preparation.stop)
 
     def test_no_change_scan_is_bounded_by_pages_not_directory_count(self):
         self.host.dirs.update({str(1000+i): ('10', 'folder'+str(i)) for i in range(258)})

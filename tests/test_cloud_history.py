@@ -228,6 +228,64 @@ class HistoryTests(unittest.TestCase):
         second=dict(kind='file',id='102',size=6,sha1=hashlib.sha1(b'second').hexdigest())
         with self.assertRaises(RuntimeError): self.backend.delete('branch/second.png',second)
         self.assertEqual(self.cloud.files['102']['cid'],'20')
+        self.assertEqual(self.cloud.files['102']['n'],'second.png')
+
+    def test_missing_history_root_keeps_new_delete_visible_until_restored(self):
+        op,tx=self.legacy();self.backend.migrate_delete_history([op])
+        history=CloudHistory(self.backend)
+        registry=history.registry_path.read_bytes()
+        root=json.loads(registry)['root']['id']
+        original=self.cloud.dirs.pop(root)
+        self.cloud.put('102','20','second.png',b'second')
+        second=dict(kind='file',id='102',size=6,sha1=hashlib.sha1(b'second').hexdigest())
+        self.cloud.posts.clear()
+        with self.assertRaisesRegex(RuntimeError,'回收站恢复原目录'):
+            self.backend.delete('branch/second.png',second)
+        self.assertEqual(self.cloud.files['102']['n'],'second.png')
+        self.assertEqual(self.cloud.files['102']['cid'],'20')
+        self.assertEqual(self.cloud.posts,[])
+        self.assertEqual(history.registry_path.read_bytes(),registry)
+        self.assertEqual(history.info(op)['stage'],'moved')
+        self.cloud.dirs[root]=original
+        self.backend.delete('branch/second.png',second)
+        self.assertNotEqual(self.cloud.files['102']['cid'],'20')
+
+    def test_replaced_history_partition_keeps_new_delete_visible(self):
+        op,tx=self.legacy();self.backend.migrate_delete_history([op])
+        registry=json.loads(CloudHistory(self.backend).registry_path.read_bytes())
+        task_partition=registry['directories']['任务-'+self.backend.task['id']]
+        old=task_partition['id']; parent,name=self.cloud.dirs[old]
+        self.cloud.dirs[old]=(parent,name+'-moved')
+        self.cloud.dirs['777']=(parent,name)
+        self.cloud.put('102','20','second.png',b'second')
+        second=dict(kind='file',id='102',size=6,sha1=hashlib.sha1(b'second').hexdigest())
+        self.cloud.posts.clear()
+        with self.assertRaisesRegex(RuntimeError,'历史分片目录已被替换'):
+            self.backend.delete('branch/second.png',second)
+        self.assertEqual(self.cloud.files['102']['n'],'second.png')
+        self.assertEqual(self.cloud.posts,[])
+
+    def test_new_partition_refreshes_transport_after_history_restore(self):
+        op,tx=self.legacy();self.backend.migrate_delete_history([op])
+        registry=json.loads(CloudHistory(self.backend).registry_path.read_bytes())
+        parent=registry['directories']['任务-'+self.backend.task['id']]['path']
+        stale={'/115', '/115'+registry['root']['path'], '/115'+parent}
+        original_api=self.cloud.api
+        def api(endpoint, data, token):
+            if endpoint=='/api/fs/list' and data.get('refresh'):
+                if data['path'].rpartition('/')[0] in stale:
+                    raise RuntimeError('cached ancestor still missing')
+                stale.discard(data['path'])
+            if endpoint=='/api/fs/mkdir' and data['path'].rpartition('/')[0] in stale:
+                raise RuntimeError('cached deleted parent')
+            return original_api(endpoint,data,token)
+        self.cloud.api=api
+        self.cloud.put('102','20','second.png',b'second')
+        second=dict(kind='file',id='102',size=6,sha1=hashlib.sha1(b'second').hexdigest())
+        operation,tx=self.legacy('c'*32,'branch/second.png',second)
+        self.assertEqual(self.backend.migrate_delete_history([operation])[operation]['stage'],'moved')
+        self.assertEqual(stale,set())
+        self.assertNotEqual(self.cloud.files['102']['cid'],'20')
 
     def test_nonempty_directory_including_excluded_items_is_never_deleted(self):
         self.cloud.files.clear();self.cloud.put('100','20','desktop.ini',b'user body')

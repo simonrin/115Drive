@@ -23,6 +23,16 @@ _LOCKS = {}
 _LOCKS_LOCK = threading.Lock()
 
 
+def history_mode(host):
+    """Retention changes require an explicit setting; existing installs retain."""
+    path = getattr(host, 'CONFIG', None)
+    if path is None or not Path(path).exists(): return 'retain'
+    config = json.loads(Path(path).read_text(encoding='utf-8-sig'))
+    mode = config.get('cloud_history_mode', 'retain')
+    if mode not in ('retain', 'recycle'): raise ValueError('无效的云端历史保留方式。')
+    return mode
+
+
 def _version(item):
     if item is None: return None
     return item['kind'], item['id'], item.get('size', 0), item.get('sha1', '')
@@ -123,6 +133,7 @@ class CloudHistory:
         self._check_outside_tasks(root['path'])
         actual = self._lookup(root['path'])
         if root['id'] is not None:
+            if actual is None: raise RuntimeError('同步历史目录不存在，请从网盘回收站恢复原目录后重试。')
             if actual != root['id']: raise RuntimeError('同步历史区已移动或被替换，保留原归档等待处理。')
         else:
             # The unpredictable name was persisted before creation. A lost
@@ -153,12 +164,32 @@ class CloudHistory:
                 if actual != directory['id']: raise RuntimeError('历史分片目录已被替换。')
             else:
                 if actual is None:
+                    # Raw identity checks can see a restored history directory
+                    # before OpenList drops its cached deleted-parent entry.
+                    transport = '/115'
+                    parents = [''] + path.rpartition('/')[0].strip('/').split('/')
+                    for component in parents:
+                        if component: transport += '/'+component
+                        self.backend._api('/api/fs/list', dict(path=transport,
+                            password='', page=1, per_page=0, refresh=True))
                     self.backend._api('/api/fs/mkdir', dict(path='/115'+path))
                     actual = self._lookup(path)
                 if actual is None: raise RuntimeError('历史分片目录创建尚未确认。')
                 directory['id'] = actual
                 self._save(self.registry_path, registry)
         return relative, registry['directories'][relative]
+
+    def prepare(self, operation):
+        """Prove a usable destination before renaming a visible source.
+
+        archive() repeats these checks at submission time, since a successful
+        preflight does not protect against a later concurrent cloud edit.
+        """
+        if self.backend.read_only: raise RuntimeError('只读会话禁止迁移同步历史。')
+        self.receipt_path(operation)
+        with self.locked():
+            self._verify_account()
+            self._partition(self._root(), operation)
 
     def _destination_rows(self, registry, relative, partition):
         root = registry['root']
@@ -294,3 +325,96 @@ class CloudHistory:
             if _version(target) != _version(expected) or source.get(archive) is not None:
                 raise RemoteChanged('历史移动尚未核验，保留事务以便恢复。')
             return self._finish(operation, receipt, expected)
+
+
+class CloudRecycle(CloudHistory):
+    """Recycle proven temporary versions, retaining only local recovery metadata.
+
+    The original v1 journal is immutable. A durable receipt precedes recycling,
+    so a lost reply is recovered by re-reading the source, never by blindly
+    resubmitting its ID after another client may have moved it.
+    """
+    def prepare(self, operation):
+        if self.backend.read_only: raise RuntimeError('只读会话禁止回收云端版本。')
+        self.receipt_path(operation)
+
+    def _finish_recycle(self, operation, receipt, parent, verification):
+        self.backend._api('/api/fs/list', dict(path='/115/'+self.backend.remote+
+            ('/'+remote_relative(parent) if parent else ''), password='', page=1, per_page=0, refresh=True))
+        receipt.update(stage='recycled', verification=verification)
+        self._save(self.receipt_path(operation), receipt)
+        return receipt
+
+    def archive(self, operation, tx, *, actual_archive=None):
+        from task_backend import RemoteChanged, ConcurrentChange
+        if self.backend.read_only: raise RuntimeError('只读会话禁止回收云端版本。')
+        expected = tx.get('expected')
+        deleting = tx.get('kind') == 'delete'
+        if (tx.get('version') != 1 or tx.get('backend') != self.backend.identity
+                or not isinstance(expected, dict) or expected.get('kind') not in ('file', 'dir')
+                or not deleting and not (tx.get('committed') and tx.get('archived') and tx.get('uploaded'))):
+            raise RemoteChanged('回收版本的事务或文件身份不匹配。')
+        original = relative_path(tx['path'])
+        archive = relative_path(actual_archive or tx['archive'])
+        with self.locked():
+            receipt = self.info(operation)
+            wanted = dict(account=self.account, task_id=self.backend.task['id'], operation=operation,
+                backend=tx['backend'], source_root_id=self.backend.root_id,
+                source_cloud_path='/'+self.backend.remote+'/'+remote_relative(original),
+                source_archive=tx['archive'], expected=expected)
+            def stop(reason, observed=None):
+                nonlocal receipt
+                if receipt is None:
+                    receipt = dict(version=1, **wanted, actual_source_archive=archive, disposition='recycle')
+                receipt.update(stage='conflict', reason=reason)
+                if observed is not None: receipt['observed'] = observed
+                self._save(self.receipt_path(operation), receipt)
+                raise ConcurrentChange(reason)
+            if receipt:
+                if any(receipt.get(key) != value for key,value in wanted.items()):
+                    raise RemoteChanged('已保存回收记录与原事务不一致。')
+                if receipt.get('stage') in ('moved', 'recycled'): return receipt
+                if receipt.get('stage') == 'conflict':
+                    raise ConcurrentChange(receipt.get('reason', '临时版本回收需要处理。'))
+                if receipt.get('disposition') != 'recycle':
+                    raise RemoteChanged('原事务仍在迁移历史，请先完成恢复。')
+                archive = relative_path(receipt['actual_source_archive'])
+            parent = archive.rpartition('/')[0]
+            self._verify_account()
+            rows = self.backend._scoped_rows(parent)
+            archived = rows.get(archive)
+            if archived is None:
+                if receipt and receipt['stage'] == 'recycling':
+                    # Absence after durable submission intent is terminal. Do
+                    # not chase/recycle an ID another client moved elsewhere.
+                    return self._finish_recycle(operation, receipt, parent, 'absent_after_submission')
+                if receipt is None: return dict(stage='not_archived', operation=operation)
+                raise ConcurrentChange('待回收版本已移走，已保留处理记录。')
+            if _version(archived) != _version(expected):
+                stop('临时版本在回收前发生变化，保留正文等待处理。', archived)
+            if receipt is None:
+                receipt = dict(version=1, **wanted, actual_source_archive=archive,
+                               disposition='recycle', stage='recycle_prepared')
+                self._save(self.receipt_path(operation), receipt)
+            self.backend.transaction_fault('before_remote_recycle')
+            self._verify_account()
+            rows = self.backend._scoped_rows(parent)
+            if _version(rows.get(archive)) != _version(expected):
+                stop('提交回收前临时版本发生变化，保留正文。', rows.get(archive))
+            if rows.get(original, {}).get('id') == expected['id']:
+                raise ConcurrentChange('原文件尚未完成归档，不能回收。')
+            if not deleting and _version(rows.get(original)) != _version(tx['uploaded']):
+                stop('新版本在清理旧版本前发生变化，保留旧版本等待处理。')
+            if expected['kind'] == 'dir' and self.backend._all_children(archive, expected):
+                stop('待回收目录出现新文件，保留目录及正文。')
+            if self.backend.cancelled is not None and self.backend.cancelled.is_set():
+                raise InterruptedError('任务已暂停。')
+            receipt['stage'] = 'recycling'
+            self._save(self.receipt_path(operation), receipt)
+            self.backend.post_identity('rb/delete', {'fid[0]':expected['id']})
+            self.backend.transaction_fault('after_remote_recycle')
+            self._verify_account()
+            remaining = self.backend._scoped_rows(parent)
+            if any(row['id'] == expected['id'] for row in remaining.values()):
+                raise RemoteChanged('回收结果尚未核验，保留事务等待重试。')
+            return self._finish_recycle(operation, receipt, parent, 'submission_and_source_absence')
