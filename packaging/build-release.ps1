@@ -1,4 +1,4 @@
-param([string]$Python='python.exe',[string]$DependencyRoot,[string]$OutputDirectory,[ValidatePattern('^[0-9]+\.[0-9]+(?:\.[0-9]+)?(?:-[a-z0-9.]+)?$')][string]$Version='1.0.1')
+param([string]$Python='python.exe',[string]$DependencyRoot,[string]$OutputDirectory,[ValidatePattern('^[0-9]+\.[0-9]+(?:\.[0-9]+)?(?:-[a-z0-9.]+)?$')][string]$Version='1.0.2')
 $ErrorActionPreference='Stop'
 $root=Split-Path $PSScriptRoot
 if (-not $DependencyRoot) { $DependencyRoot=$root }

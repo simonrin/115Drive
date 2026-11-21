@@ -24,7 +24,7 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('release',type=Path)
     parser.add_argument('--work',type=Path,required=True,help='A new disposable directory')
-    parser.add_argument('--version',default='1.0.1')
+    parser.add_argument('--version',default='1.0.2')
     args=parser.parse_args()
     release=args.release.resolve();work=args.work.resolve()
     work.mkdir(parents=True,exist_ok=False)
