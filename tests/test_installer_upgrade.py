@@ -60,6 +60,7 @@ class InstallerTests(unittest.TestCase):
     def test_badge_program_upgrade_preserves_personal_folder_icons(self):
         additions = {'register-folder-badge.ps1': b'badge entry point',
                      'register-account-navigation.ps1': b'account navigation',
+                     'sync-navigation-layout.ps1': b'copy local folder layout',
                      'tray/FolderBadge.dll': b'badge renderer',
                      'tray/115Drive-folder.ico': b'folder fallback'}
         for name, data in additions.items():
