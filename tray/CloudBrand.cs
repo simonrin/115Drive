@@ -6,28 +6,46 @@ using System.Drawing.Imaging;
 using System.IO;
 
 namespace TwoDrive {
- // Vector cloud silhouette, with optical simplification for notification-area sizes.
+ // Rounded two-tone cloud shared by the app, its tray states and folder badges.
  public static class CloudBrand {
-  public const string Indigo="#375F83",Paper="#FFFFFF";
+  public const string Indigo="#235C90",Paper="#FFFFFF",MarkRed="#CC555C",MarkBlue="#387EB1";
   static Color Hex(string value) { return ColorTranslator.FromHtml(value); }
-  static GraphicsPath Cloud(bool compact) {
+  static GraphicsPath Cloud() {
    var p=new GraphicsPath();
-   p.AddBezier(12,49,1,49,-1,32,9,28);
-   p.AddBezier(9,28,5,16,15,11,23,16);
-   p.AddBezier(23,16,26,2,48,3,48,24);
-   if(compact) {
-    p.AddBezier(48,24,61,22,65,40,54,46);
-    p.AddBezier(54,46,47,52,42,52,35,48);
-   } else {
-    p.AddBezier(48,24,57,22,52,38,62,31);
-    p.AddBezier(62,31,61,42,53,44,48,43);
-    p.AddBezier(48,43,46,53,39,55,33,49);
-   }
-   p.AddBezier(compact?35:33,48,25,58,17,55,12,49);
+   p.AddBezier(17,49,1,49,0,28,15,25);
+   p.AddBezier(15,25,18,6,45,6,49,25);
+   p.AddBezier(49,25,65,26,65,49,49,49);
+   p.AddLine(49,49,17,49);
    p.CloseFigure();return p;
   }
   static Pen Stroke(Color color,float width) {
    return new Pen(color,width){StartCap=LineCap.Round,EndCap=LineCap.Round,LineJoin=LineJoin.Round};
+  }
+  static void DrawCloudMark(Graphics g,bool compact) {
+   using(var outline=new GraphicsPath())
+   using(var front=new GraphicsPath()) {
+    // The small coral cloud and the blue crown share a continuous outer edge.
+    outline.AddBezier(16,52,8,52,2,47,2,39);
+    outline.AddBezier(2,39,2,33,5,28,10,26);
+    outline.AddBezier(10,26,11,19,18,16,24,20);
+    front.AddPath(outline,false);
+    outline.AddBezier(24,20,27,12,33,9,40,10);
+    outline.AddBezier(40,10,49,11,54,17,54,25);
+    outline.AddBezier(54,25,59,27,62,32,62,38);
+    outline.AddBezier(62,38,62,46,56,52,48,52);
+    outline.CloseFigure();
+    front.AddBezier(24,20,22,23,21,27,22,30);
+    front.AddBezier(22,30,30,28,36,33,36,40);
+    front.AddBezier(36,40,36,47,31,52,24,52);
+    front.CloseFigure();
+    using(var sky=new LinearGradientBrush(new Point(0,8),new Point(0,54),Hex(compact?MarkBlue:"#62AFD8"),Hex(compact?MarkBlue:"#256699")))
+    using(var coral=new LinearGradientBrush(new Point(0,16),new Point(0,54),Hex(compact?MarkRed:"#F09580"),Hex(compact?MarkRed:"#C45162")))
+    using(var rim=Stroke(Color.FromArgb(compact?238:210,248,251,255),compact?2.8f:1.25f)) {
+     g.FillPath(sky,outline);
+     g.FillPath(coral,front);
+     g.DrawPath(rim,outline);
+    }
+   }
   }
   static Bitmap RenderFolder(int size) {
    var bitmap=new Bitmap(size,size,PixelFormat.Format32bppArgb);
@@ -35,17 +53,16 @@ namespace TwoDrive {
     g.SmoothingMode=SmoothingMode.AntiAlias;g.PixelOffsetMode=PixelOffsetMode.HighQuality;
     g.InterpolationMode=InterpolationMode.HighQualityBicubic;
     g.ScaleTransform(size/64f,size/64f);
-    // Upright yellow folder, with the same cloud/curl used by the app in front.
+    // Upright yellow folder with the app cloud in front.
     using(var back=new SolidBrush(Hex("#FFDF7E")))
      g.FillPolygon(back,new[]{new PointF(12,5),new PointF(45,5),new PointF(47,7),new PointF(47,55),new PointF(24,61),new PointF(12,53)});
     using(var inside=new SolidBrush(Hex("#F3CC62")))
      g.FillPolygon(inside,new[]{new PointF(12,5),new PointF(25,16),new PointF(45,16),new PointF(45,5)});
-    using(var face=new SolidBrush(Hex("#FFE593")))
+    using(var face=new LinearGradientBrush(new Point(25,16),new Point(47,61),Hex("#FFE59E"),Hex("#F5BE52")))
      g.FillPolygon(face,new[]{new PointF(25,16),new PointF(47,16),new PointF(47,55),new PointF(25,61)});
     using(var edge=new SolidBrush(Hex("#FFF0B4")))
      g.FillPolygon(edge,new[]{new PointF(12,5),new PointF(25,16),new PointF(25,61),new PointF(12,53)});
-    // Render the original mark at sufficient detail to retain its white curl.
-    using(var mark=Render(Math.Max(64,size),"app"))g.DrawImage(mark,new RectangleF(22,26,42,42));
+    using(var mark=Render(Math.Max(16,(int)Math.Round(size*.63)),"app"))g.DrawImage(mark,new RectangleF(23,23,40,40));
    }
    return bitmap;
   }
@@ -57,31 +74,30 @@ namespace TwoDrive {
     g.SmoothingMode=SmoothingMode.AntiAlias;g.PixelOffsetMode=PixelOffsetMode.HighQuality;
     g.ScaleTransform(size/64f,size/64f);
     if(mode=="keep-local") {
-     using(var fill=new SolidBrush(Hex("#247A55")))g.FillEllipse(fill,5,5,54,54);
+     using(var rim=new SolidBrush(Hex("#D6EDE3")))g.FillEllipse(rim,3,3,58,58);
+     using(var fill=new SolidBrush(Hex("#197553")))g.FillEllipse(fill,5,5,54,54);
      using(var pen=Stroke(Color.White,6))g.DrawLines(pen,new[]{new PointF(17,32),new PointF(28,43),new PointF(47,21)});
      return bitmap;
     }
     if(mode=="free-space") {
-     using(var cloud=Cloud(true))using(var pen=Stroke(Hex("#376F9D"),4))g.DrawPath(pen,cloud);
+     using(var cloud=Cloud())
+     using(var rim=Stroke(Hex("#D5E8F6"),size<=24?10:7))
+     using(var pen=Stroke(Hex(Indigo),size<=24?5.5f:4)) {
+      g.DrawPath(rim,cloud);
+      g.DrawPath(pen,cloud);
+     }
      return bitmap;
     }
     bool compact=size<=32,paused=mode=="paused",error=mode=="error";
-    using(var cloud=Cloud(compact))using(var fill=new SolidBrush(Hex("#376F9D")))using(var rim=Stroke(Hex("#ECF3FA"),compact?2.5f:1.5f)) {
-     g.FillPath(fill,cloud);g.DrawPath(rim,cloud);
-    }
-    // One open curl at larger sizes; solid lobes remain legible at 16-32 px.
-    if(!compact)using(var curl=new GraphicsPath())using(var pen=Stroke(Color.White,3.5f)) {
-     curl.AddBezier(18,38,8,32,16,22,24,27);
-     curl.AddBezier(24,27,27,17,39,19,41,30);
-     curl.AddBezier(41,30,45,46,25,49,24,37);
-     curl.AddBezier(24,37,23,30,32,29,33,35);
-     g.DrawPath(pen,curl);
-    }
+    var placement=g.Save();
+    if(mode!="app")g.TranslateTransform(0,-4);
+    DrawCloudMark(g,compact);
+    g.Restore(placement);
     if(mode!="app") {
      // Seven pixels wide even at 16 px, with shape as well as colour encoding.
-     using(var rim=new SolidBrush(Color.White))g.FillEllipse(rim,34,33,30,30);
-     using(var badge=new SolidBrush(Hex(error?"#B84141":paused?"#667385":mode=="idle"?"#247A55":"#375F83")))g.FillEllipse(badge,37,36,24,24);
-     using(var pen=Stroke(Color.White,compact?4:3.2f)) {
+     using(var rim=new SolidBrush(Color.White))g.FillEllipse(rim,32,31,32,32);
+     using(var badge=new SolidBrush(Hex(error?"#AC3842":paused?"#52627A":mode=="idle"?"#197553":Indigo)))g.FillEllipse(badge,35,34,26,26);
+     using(var pen=Stroke(Color.White,compact?4.5f:3.6f)) {
       if(mode=="idle")g.DrawLines(pen,new[]{new PointF(42,48),new PointF(47,53),new PointF(55,43)});
       else if(paused){g.DrawLine(pen,45,42,45,54);g.DrawLine(pen,53,42,53,54);}
       else if(error){g.DrawLine(pen,49,41,49,48);g.DrawLine(pen,49,54,49,54.2f);}

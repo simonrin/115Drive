@@ -89,7 +89,32 @@ function ValidateLibrary([string]$path,[string]$target) {
     $ns = New-Object Xml.XmlNamespaceManager($xml.NameTable)
     $ns.AddNamespace('l','http://schemas.microsoft.com/windows/2009/library')
     $locations = @($xml.SelectNodes('/l:libraryDescription/l:searchConnectorDescriptionList/l:searchConnectorDescription/l:simpleLocation/l:url',$ns))
-    if ($locations.Count -ne 1 -or $locations[0].InnerText -ne $target) { throw 'Navigation library target changed.' }
+    if ($locations.Count -ne 1) { throw 'Navigation library target changed.' }
+    $location = $locations[0].InnerText
+    # Explorer may serialize a redirected folder such as Pictures by its known-folder ID.
+    if ($location -match '^knownfolder:(\{[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\})$') {
+        $folderId = [Guid]$Matches[1]
+        if (-not ('TwoDriveKnownFolderPath' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class TwoDriveKnownFolderPath {
+    [DllImport("shell32.dll", ExactSpelling = true)]
+    private static extern int SHGetKnownFolderPath(ref Guid id, uint flags, IntPtr token, out IntPtr path);
+    public static string Resolve(Guid id) {
+        IntPtr path;
+        int result = SHGetKnownFolderPath(ref id, 0, IntPtr.Zero, out path);
+        try {
+            Marshal.ThrowExceptionForHR(result);
+            return Marshal.PtrToStringUni(path);
+        } finally { Marshal.FreeCoTaskMem(path); }
+    }
+}
+'@
+        }
+        $location = [TwoDriveKnownFolderPath]::Resolve($folderId)
+    }
+    if (-not [string]::Equals($location, $target, [StringComparison]::OrdinalIgnoreCase)) { throw 'Navigation library target changed.' }
 }
 function ValidateLegacyLink($entry) {
     $path = [IO.Path]::GetFullPath($entry.path)

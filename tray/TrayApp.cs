@@ -26,16 +26,21 @@ using Forms = System.Windows.Forms;
 
 namespace TwoDrive {
  sealed partial class TrayApp : IDisposable {
+  const string ThemeColor="#36638C";
   readonly string root;
   readonly bool test;
   readonly JavaScriptSerializer json = new JavaScriptSerializer();
   readonly Window panel;
+  readonly double panelHeightLimit;
   readonly Forms.NotifyIcon notify;
   readonly Dictionary<string,Drawing.Icon> icons = new Dictionary<string,Drawing.Icon>();
   readonly DispatcherTimer timer;
   Dictionary<string,object> state = new Dictionary<string,object>();
   bool exiting, sending, activityDialogOpen;
   bool statusSpinning;
+  Rect panelWorkArea;
+  Point panelAnchor;
+  bool panelAboveAnchor;
   readonly RotateTransform statusRotation=new RotateTransform();
   ContextMenu activityMenu;
   string activityTestRoot="",lastActivityTarget="";
@@ -85,24 +90,27 @@ namespace TwoDrive {
   TrayApp(string folder,bool selfTest) {
    root=folder; test=selfTest;
    using(var stream=File.OpenRead(Path.Combine(root,"tray/Panel.xaml")))panel=(Window)XamlReader.Load(stream);
+   panelHeightLimit=panel.MaxHeight;
    panel.Icon=BrandImage();Find<Image>("BrandIcon").Source=panel.Icon;
+   panel.SizeChanged+=(s,e)=>PositionPanel();
    panel.Closing+=(s,e)=>{if(!exiting){e.Cancel=true;panel.Hide();}};
    panel.Deactivated+=(s,e)=>{if(!test)panel.Dispatcher.BeginInvoke((Action)(()=>{if(!activityDialogOpen && !panel.IsActive && (activityMenu==null || !activityMenu.IsOpen)){hiddenAt=DateTime.UtcNow;panel.Hide();}}),DispatcherPriority.Background);};
-   Label("StatusSymbol").RenderTransform=statusRotation;
+   Find<System.Windows.Shapes.Path>("StatusSymbol").RenderTransform=statusRotation;
    panel.KeyDown+=(s,e)=>{if(e.Key==Key.Escape)panel.Hide();};
    Find<Button>("CloseButton").Click+=(s,e)=>panel.Hide();
    Find<Button>("FolderButton").Click+=(s,e)=>LaunchFolder();
    Find<Button>("SettingsButton").Click+=(s,e)=>OpenSettings();
-   Find<Button>("IssuesButton").Click+=(s,e)=>OpenSyncIssues();
+   Find<Button>("StatusCard").Click+=(s,e)=>OpenSyncIssues();
    Find<Button>("SyncButton").Click+=(s,e)=>Send("sync-now");
    Find<Button>("PauseButton").Click+=(s,e)=>Send(PauseCommand());
    notify=new Forms.NotifyIcon();
    foreach(string mode in new[]{"idle","sync","paused","error"})icons[mode]=CreateIcon(mode);
    notify.Icon=icons["idle"];notify.Text="115Drive · 正在读取状态";notify.Visible=!test;
    notify.MouseClick+=(s,e)=>{if(e.Button==Forms.MouseButtons.Left)TogglePanel();};
-   var menu=new Forms.ContextMenuStrip{BackColor=Drawing.ColorTranslator.FromHtml("#FFFFFF"),ForeColor=Drawing.ColorTranslator.FromHtml("#243247")};
+   var menu=new Forms.ContextMenuStrip{ShowImageMargin=false};
    menu.Items.Add("查看同步进度",null,(s,e)=>ShowPanel(false));
    menu.Items.Add("立即同步",null,(s,e)=>Send("sync-now"));
+   menu.Items.Add(new Forms.ToolStripSeparator());
    menu.Items.Add("打开同步文件夹",null,(s,e)=>LaunchFolder());
    menu.Items.Add("在 115 中查看",null,(s,e)=>Launch("https://115.com/"));
    menu.Items.Add("设置",null,(s,e)=>OpenSettings());
@@ -144,20 +152,20 @@ namespace TwoDrive {
 
   void Render(Dictionary<string,object> model,Dictionary<string,object> progress,object recent) {
    state=model;
-   string mode=Text(model,"state"), title="正在读取同步状态", detail=Text(model,"message"), color="#FFFBE5", ink=CloudBrand.Indigo, symbol="↻", icon="sync";
+   string mode=Text(model,"state"), title="正在读取同步状态", detail=Text(model,"message"), icon="sync";
    bool active=mode=="syncing" || mode=="checking" || mode=="stopping";
    bool retrying=Retrying(model);
    bool problem=mode=="error" || retrying;
-   if(mode=="idle" || mode=="ready") {title="所有文件已同步";color="#EDF5EE";ink="#287B56";symbol="✓";icon="idle";detail=Text(Read("config.json"),"local_path")+"  ↔  115 网盘 /115Drive";}
-   else if(mode=="relocating") {title="正在更改同步文件夹";icon="paused";symbol="Ⅱ";}
+   if(mode=="idle" || mode=="ready") {title="所有文件已同步";icon="idle";detail=Text(Read("config.json"),"local_path")+"  ↔  115 网盘 /115Drive";}
+   else if(mode=="relocating") {title="正在更改同步文件夹";icon="paused";}
    else if(mode=="checking") {title="正在检查文件变化";detail="正在核对本地与网盘目录，传输开始后会显示进度。";}
    else if(mode=="syncing") {title="正在同步文件";}
-   else if(mode=="paused") {title="同步已暂停";color="#F1F3F6";ink="#6D7887";symbol="Ⅱ";icon="paused";detail="点击恢复后校验已保存分片，继续传输剩余部分。";}
+   else if(mode=="paused") {title="同步已暂停";icon="paused";detail="点击恢复后校验已保存分片，继续传输剩余部分。";}
    else if(mode=="stopping") {title="正在暂停同步";detail="正在停止当前传输并保留续传分片。";}
-   if(problem) {title="同步遇到问题";detail=Text(model,"message");color="#FBEEE8";ink="#AA282C";symbol="!";icon="error";}
+   if(problem) {title="同步遇到问题";detail=Text(model,"message");icon="error";}
    if(retrying) {title=RetryTitle(model);detail+="\n将自动重试；点击“立即同步”可提前重试，点击“暂停同步”可停止自动重试。";}
    bool workerMissing=!WorkerExists() && mode!="relocating" && (retrying || (mode!="paused" && !problem));
-   if(workerMissing) {title="后台尚未运行";detail="点击立即同步，启动后台并检查文件变化。";symbol="Ⅱ";icon="paused";color="#F1F3F6";ink="#6D7887";active=false;}
+   if(workerMissing) {title="后台尚未运行";detail="点击立即同步，启动后台并检查文件变化。";icon=problem?"error":"paused";active=false;}
    var files=Rows(Value(progress,"active")).ToList();
    var file=files.FirstOrDefault();
    if(mode=="paused" && !problem && file!=null && Text(file,"progress_source")=="backend" && Number(file,"size")>0 && Number(file,"bytes")>0) {
@@ -189,35 +197,34 @@ namespace TwoDrive {
     if(!String.IsNullOrEmpty(count))title+=" · "+count;
     detail=String.IsNullOrEmpty(path)?"正在核对本地与网盘目录。":path;
    }
+   string checkedAt=Text(model,"last_check_at",Text(progress,"last_check_at"));
+   string syncedAt=Text(model,"last_sync_at",Text(progress,"last_sync_at"));
+   string transferredAt=Text(model,"last_transfer_at",Text(progress,"last_transfer_at"));
+   Label("LastSyncLabel").Text=String.IsNullOrEmpty(checkedAt)?"":"最近检查 "+TimeLabel(checkedAt);
+   string timeDetails="最近检查："+(String.IsNullOrEmpty(checkedAt)?"尚无记录":TimeLabel(checkedAt))+
+    "\n同步成功："+(String.IsNullOrEmpty(syncedAt)?"尚无记录":TimeLabel(syncedAt))+
+    "\n文件传输："+(String.IsNullOrEmpty(transferredAt)?"尚无记录":TimeLabel(transferredAt));
+   Label("LastSyncLabel").ToolTip=timeDetails;
    if(Object.Equals(Value(model,"task_mode"),true) && !workerMissing) {
     int count=(int)Number(model,"active_tasks"),pausedCount=(int)Number(model,"paused_tasks");
-    title=mode=="idle"?count+" 个任务已同步"+(pausedCount>0?" · "+pausedCount+" 个已暂停":""):mode=="paused"?"全部任务已暂停":mode=="stopping"?"正在暂停全部任务":mode=="error"?"部分任务需要处理":count+" 个任务正在同步";
+    if(!retrying && mode!="relocating") {
+     if(icon=="idle")title=count+" 个任务已同步"+(pausedCount>0?" · "+pausedCount+" 个已暂停":"");
+     else if(mode=="paused")title="全部任务已暂停";
+     else if(mode=="stopping")title="正在暂停全部任务";
+     else if(problem)title="部分任务需要处理";
+     else if(active)title=count+" 个任务正在同步";
+    }
     detail=Text(model,"message");
     var taskProgress=Rows(Value(progress,"active")).ToList();
+    if(icon=="idle" && taskProgress.Count==0 && (!String.IsNullOrEmpty(checkedAt) || !String.IsNullOrEmpty(syncedAt) || !String.IsNullOrEmpty(transferredAt)))
+     detail=timeDetails;
     if(taskProgress.Count>0) {
      if(active && !problem && mode!="stopping")title=TaskProgressTitle(taskProgress[0]);
      detail+="\n"+String.Join("\n",taskProgress.Select(TaskProgressDetail));
     }
    }
-   Label("StatusTitle").Text=title;Label("StatusSymbol").Text=symbol;
-   Label("StatusSymbol").Foreground=Brush(ink);Label("StatusTitle").Foreground=Brush("#243247");
-   Find<Border>("StatusCard").Background=problem?Brush(color):Brushes.Transparent;
-   Find<Button>("IssuesButton").Visibility=problem?Visibility.Visible:Visibility.Collapsed;
-   Label("StatusTitle").ToolTip=new TextBlock{Text=title+"\n"+detail,TextWrapping=TextWrapping.Wrap,MaxWidth=360};
-   bool spin=active && !problem && symbol=="↻" && SystemParameters.ClientAreaAnimation;
-   if(spin!=statusSpinning) {
-    statusSpinning=spin;
-    statusRotation.BeginAnimation(RotateTransform.AngleProperty,spin?new DoubleAnimation(0,360,TimeSpan.FromSeconds(1.2)){RepeatBehavior=RepeatBehavior.Forever}:null);
-    if(!spin)statusRotation.Angle=0;
-   }
+   ShowStatus(icon,title,detail,active);
    notify.Icon=icons[icon];notify.Text=("115Drive · "+title).Substring(0,Math.Min(63,("115Drive · "+title).Length));
-   string checkedAt=Text(model,"last_check_at",Text(progress,"last_check_at"));
-   string syncedAt=Text(model,"last_sync_at",Text(progress,"last_sync_at"));
-   string transferredAt=Text(model,"last_transfer_at",Text(progress,"last_transfer_at"));
-   Label("LastSyncLabel").Text=String.IsNullOrEmpty(checkedAt)?"":"最近检查 "+TimeLabel(checkedAt);
-   Label("LastSyncLabel").ToolTip="最近检查："+(String.IsNullOrEmpty(checkedAt)?"尚无记录":TimeLabel(checkedAt))+
-    "\n同步成功："+(String.IsNullOrEmpty(syncedAt)?"尚无记录":TimeLabel(syncedAt))+
-    "\n文件传输："+(String.IsNullOrEmpty(transferredAt)?"尚无记录":TimeLabel(transferredAt));
    bool paused=(!retrying && (mode=="paused" || (mode=="error" && !Object.Equals(Value(model,"requires_action"),true)))) || !WorkerExists();
    if(Object.Equals(Value(model,"task_mode"),true))paused=Number(model,"active_tasks")==0;
    Label("PauseLabel").Text=paused?"恢复同步":"暂停同步";
@@ -231,6 +238,26 @@ namespace TwoDrive {
    string serialized=json.Serialize(visible)+local+json.Serialize(activityTaskRoots)+DateTime.Now.ToString("yyyyMMddHHmm")+String.Join("|",visible.Select(row=>DescribeActivity(row,ActivityLocalRoot(row)).Status));
    if(serialized!=lastActivities && activityMenu==null){lastActivities=serialized;RenderActivities(visible);}
    if(!test)try {Save("runtime/tray-session.json",new{pid=Process.GetCurrentProcess().Id,updated_at=DateTimeOffset.Now.ToString("o"),icon_visible=notify.Visible,panel_visible=panel.IsVisible,title=title,worker_running=WorkerExists()});}catch{}
+  }
+
+  void ShowStatus(string icon,string title,string detail,bool active) {
+   var symbol=Find<System.Windows.Shapes.Path>("StatusSymbol");
+   symbol.Data=(Geometry)panel.FindResource("Glyph-"+icon);
+   var card=Find<Button>("StatusCard");
+   card.IsEnabled=icon=="error";
+   detail=(detail??"").Trim();
+   if(card.IsEnabled)detail=(detail+"\n点击图标可查看同步问题。").Trim();
+   Label("StatusTitle").Text=title;
+   var description=Label("StatusDetail");
+   description.Text=detail;
+   description.Visibility=detail.Length==0?Visibility.Collapsed:Visibility.Visible;
+   System.Windows.Automation.AutomationProperties.SetName(card,title);
+   System.Windows.Automation.AutomationProperties.SetHelpText(card,detail);
+   bool spin=active && icon=="sync" && SystemParameters.ClientAreaAnimation;
+   if(spin==statusSpinning)return;
+   statusSpinning=spin;
+   statusRotation.BeginAnimation(RotateTransform.AngleProperty,spin?new DoubleAnimation(0,360,TimeSpan.FromSeconds(1.2)){RepeatBehavior=RepeatBehavior.Forever}:null);
+   if(!spin)statusRotation.Angle=0;
   }
 
   string TaskProgressTitle(Dictionary<string,object> row) {
@@ -261,24 +288,24 @@ namespace TwoDrive {
    foreach(var item in rows.Where(row=>Text(row,"action")!="backup")) {
     var description=DescribeActivity(item,ActivityLocalRoot(item));
     var grid=new Grid();
-    grid.ColumnDefinitions.Add(new ColumnDefinition{Width=new GridLength(46)});grid.ColumnDefinitions.Add(new ColumnDefinition());
-    var badge=new Border{Width=34,Height=44,VerticalAlignment=VerticalAlignment.Center,HorizontalAlignment=HorizontalAlignment.Left};
+    grid.ColumnDefinitions.Add(new ColumnDefinition{Width=new GridLength(48)});grid.ColumnDefinitions.Add(new ColumnDefinition());
+    var badge=new Border{Width=38,Height=38,CornerRadius=new CornerRadius(8),Background=Brush("#EDF3F8"),VerticalAlignment=VerticalAlignment.Center,HorizontalAlignment=HorizontalAlignment.Left};
     var icon=ActivityIcon(Text(item,"name"));
-    badge.Child=icon!=null?(UIElement)new Image{Source=icon,Width=32,Height=32,Stretch=Stretch.Uniform}:new TextBlock{Text="\uE8A5",FontFamily=new FontFamily("Segoe MDL2 Assets"),FontSize=27,Foreground=Brush(CloudBrand.Indigo),VerticalAlignment=VerticalAlignment.Center};
+    badge.Child=icon!=null?(UIElement)new Image{Source=icon,Width=28,Height=28,Stretch=Stretch.Uniform}:new TextBlock{Text="\uE8A5",FontFamily=new FontFamily("Segoe MDL2 Assets"),FontSize=24,Foreground=Brush(ThemeColor),HorizontalAlignment=HorizontalAlignment.Center,VerticalAlignment=VerticalAlignment.Center};
     grid.Children.Add(badge);
     var stack=new StackPanel();Grid.SetColumn(stack,1);
-    stack.Children.Add(new TextBlock{Text=FileLabel(Text(item,"name")),ToolTip=Text(item,"name"),Foreground=Brush("#243247"),FontSize=12,TextTrimming=TextTrimming.CharacterEllipsis});
-    var destination=new TextBlock{Foreground=Brush("#596779"),FontSize=11,Margin=new Thickness(0,3,0,0),TextTrimming=TextTrimming.CharacterEllipsis};
+    stack.Children.Add(new TextBlock{Text=FileLabel(Text(item,"name")),ToolTip=Text(item,"name"),Foreground=Brush("#233F57"),FontSize=14,FontWeight=FontWeights.Normal,TextTrimming=TextTrimming.CharacterEllipsis});
+    var destination=new TextBlock{Foreground=Brush("#596779"),FontSize=12,Margin=new Thickness(0,3,0,0),TextTrimming=TextTrimming.CharacterEllipsis};
     destination.Inlines.Add(new Run((String.IsNullOrEmpty(Text(item,"task_name"))?"":Text(item,"task_name")+" · ")+description.Status));
-    if(!String.IsNullOrEmpty(description.Folder))destination.Inlines.Add(new Run(" "+description.Folder){Foreground=Brush(CloudBrand.Indigo)});
+    if(!String.IsNullOrEmpty(description.Folder))destination.Inlines.Add(new Run(" "+description.Folder){Foreground=Brush(ThemeColor)});
     stack.Children.Add(destination);
-    stack.Children.Add(new TextBlock{Text=ActivityTime(Text(item,"time")),Foreground=Brush("#667385"),FontSize=10,Margin=new Thickness(0,2,0,0)});
+    stack.Children.Add(new TextBlock{Text=ActivityTime(Text(item,"time")),Foreground=Brush("#607182"),FontSize=11,Margin=new Thickness(0,2,0,0)});
     grid.Children.Add(stack);
-    var button=new Button{Content=grid,Padding=new Thickness(12,10,12,10),HorizontalContentAlignment=HorizontalAlignment.Stretch,
+    var button=new Button{Content=grid,Padding=new Thickness(9,6,9,6),HorizontalContentAlignment=HorizontalAlignment.Stretch,
      ToolTip=Text(item,"name")+"\n单击打开当前文件 · 右键打开所在文件夹"};
     System.Windows.Automation.AutomationProperties.SetName(button,FileLabel(Text(item,"name")));
     button.Click+=(s,e)=>OpenActivity(item,false);
-    var menu=new ContextMenu();
+    var menu=new ContextMenu{FontFamily=panel.FontFamily};
     var open=new MenuItem{Header="打开文件"};open.Click+=(s,e)=>OpenActivity(item,false);
     var folder=new MenuItem{Header="打开所在文件夹"};folder.Click+=(s,e)=>OpenActivity(item,true);
     menu.Items.Add(folder);menu.Items.Add(open);
@@ -286,7 +313,8 @@ namespace TwoDrive {
     menu.Closed+=(s,e)=>{if(activityMenu==menu)activityMenu=null;if(!test && !activityDialogOpen && !panel.IsActive){hiddenAt=DateTime.UtcNow;panel.Hide();}};
     button.ContextMenu=menu;list.Children.Add(button);
    }
-   if(list.Children.Count==0)list.Children.Add(new TextBlock{Text="暂无同步记录\n添加或修改文件后，活动会显示在这里。",Foreground=Brush("#596779"),FontSize=12,Margin=new Thickness(13,24,13,12),TextWrapping=TextWrapping.Wrap,LineHeight=24});
+   if(list.Children.Count==0)list.Children.Add(new Border{Background=Brush("#F3F7FA"),CornerRadius=new CornerRadius(8),Padding=new Thickness(16,12,16,12),Margin=new Thickness(8,4,8,6),
+    Child=new TextBlock{Text="暂无同步记录\n添加或修改文件后，活动会显示在这里。",Foreground=Brush("#516578"),FontSize=12,LineHeight=22,TextWrapping=TextWrapping.Wrap}});
   }
 
   void TogglePanel() {
@@ -303,14 +331,23 @@ namespace TwoDrive {
    var transform=source==null?Matrix.Identity:source.CompositionTarget.TransformFromDevice;
    Point top=transform.Transform(new Point(area.Left,area.Top)), bottom=transform.Transform(new Point(area.Right,area.Bottom));
    Point cursor=transform.Transform(new Point(pointer.X,pointer.Y));
-   double x=byTray?cursor.X-panel.ActualWidth+28:bottom.X-panel.ActualWidth-9;
-   bool upper=pointer.Y<screen.Bounds.Top+screen.Bounds.Height/2;
-   double y=byTray?(upper?cursor.Y+9:cursor.Y-panel.ActualHeight-9):bottom.Y-panel.ActualHeight-9;
-   panel.Left=Math.Max(top.X,Math.Min(x,bottom.X-panel.ActualWidth));
-   panel.Top=Math.Max(top.Y,Math.Min(y,bottom.Y-panel.ActualHeight));
+   panelWorkArea=new Rect(top,bottom);
+   panelAboveAnchor=!byTray || pointer.Y>=screen.Bounds.Top+screen.Bounds.Height/2;
+   panelAnchor=byTray?new Point(cursor.X+28,cursor.Y+(panelAboveAnchor?-9:9)):new Point(bottom.X-9,bottom.Y-9);
+   panel.MaxWidth=panelWorkArea.Width;
+   panel.MaxHeight=Math.Min(panelHeightLimit,panelWorkArea.Height);
+   panel.UpdateLayout();PositionPanel();
    panel.Activate();
    string request=Path.Combine(root,"runtime/tray-snapshot.request");
    if(!test && File.Exists(request)) {File.Delete(request);Capture("tray-current.png");}
+  }
+
+  void PositionPanel() {
+   if(panelWorkArea.Height<=0 || !panel.IsVisible)return;
+   double x=panelAnchor.X-panel.ActualWidth;
+   double y=panelAboveAnchor?panelAnchor.Y-panel.ActualHeight:panelAnchor.Y;
+   panel.Left=Math.Max(panelWorkArea.Left,Math.Min(x,panelWorkArea.Right-panel.ActualWidth));
+   panel.Top=Math.Max(panelWorkArea.Top,Math.Min(y,panelWorkArea.Bottom-panel.ActualHeight));
   }
 
   sealed class LocalClient:WebClient {
@@ -345,7 +382,7 @@ namespace TwoDrive {
      }
     });
     Refresh();
-   }catch(Exception error){Log(error);Label("StatusTitle").Text="操作未完成";Label("StatusTitle").ToolTip="本机控制服务暂时不可用，请稍后重试或打开连接与设置。";}
+   }catch(Exception error){Log(error);ShowStatus("error","操作未完成","本机控制服务暂时不可用，请稍后重试或打开连接与设置。",false);}
    finally{sending=false;Find<Button>("PauseButton").IsEnabled=true;Find<Button>("SyncButton").IsEnabled=true;}
   }
   bool TaskMode() {return Object.Equals(Value(Read("config.json"),"legacy_enabled"),false);}
@@ -369,30 +406,61 @@ namespace TwoDrive {
    image.Render(panel);var encoder=new PngBitmapEncoder();encoder.Frames.Add(BitmapFrame.Create(image));
    using(var file=File.Create(Path.Combine(root,"runtime/"+filename)))encoder.Save(file);
   }
+  void CheckStatusLayout(string icon) {
+   panel.UpdateLayout();
+   var symbol=Find<System.Windows.Shapes.Path>("StatusSymbol");
+   if(symbol.ActualWidth!=24 || symbol.ActualHeight!=24 || symbol.Fill!=null || symbol.Data!=(Geometry)panel.FindResource("Glyph-"+icon))
+    throw new Exception("Unexpected outline or footprint for "+icon);
+   var card=Find<Button>("StatusCard");
+   var tip=card.ToolTip as ToolTip;
+   if(card.Content!=symbol || card.ActualWidth!=36 || card.ActualHeight!=36 || card.IsEnabled!=(icon=="error") ||
+      tip==null || !ToolTipService.GetShowOnDisabled(card) || LogicalTreeHelper.GetParent(Label("StatusTitle"))!=tip.Content ||
+      LogicalTreeHelper.GetParent(Label("StatusDetail"))!=tip.Content || String.IsNullOrWhiteSpace(Label("StatusTitle").Text))
+    throw new Exception("Expected one status icon with hover details for "+icon);
+   var sync=Find<Button>("SyncButton");
+   Point origin=card.TranslatePoint(new Point(0,0),panel),button=sync.TranslatePoint(new Point(0,0),panel);
+   var scroll=Find<ScrollViewer>("ActivityScroll");
+   double listBottom=scroll.TranslatePoint(new Point(0,scroll.ActualHeight),panel).Y;
+   double gap=button.Y-origin.Y-card.ActualHeight;
+   if(Math.Abs(origin.X+card.ActualWidth/2-button.X-sync.ActualWidth/2)>1.5 || gap<0 || gap>12 || listBottom>origin.Y+1)
+    throw new Exception("Floating status overlaps the activity list or is not centered above Sync");
+  }
   void SelfTest() {
    var passed=new List<string>();
    try {
     var fixture=Read("tests/tray-fixtures.json");
     TogglePanel();if(!panel.IsVisible)throw new Exception("Tray click did not open panel");passed.Add("tray_click_opens_panel");
     Render(Map(Value(fixture,"active")),Map(Value(fixture,"progress")),Value(fixture,"activity"));
-    string transferDetail=((TextBlock)Label("StatusTitle").ToolTip).Text;
+    string transferDetail=Label("StatusDetail").Text;
     if(!Label("StatusTitle").Text.Contains("38%") || !Label("StatusTitle").Text.Contains("2.00 MiB/s") || !transferDetail.Contains("设计稿.zip") || !transferDetail.Contains("6.00 MiB / 16.0 MiB"))throw new Exception("Numeric transfer progress mismatch");
     if(Find<StackPanel>("ActivityList").Children.Count!=2)throw new Exception("Recent activity mismatch");
     panel.UpdateLayout();
-    double statusHeight=Find<Border>("StatusCard").ActualHeight;
-    if(statusHeight!=24 || panel.FindName("TransferBar")!=null || panel.FindName("ScanBar")!=null)throw new Exception("Status row height or bar-free layout mismatch");
+    double statusHeight=Find<Button>("StatusCard").ActualHeight;
+    if(statusHeight!=36 || panel.FindName("TransferBar")!=null || panel.FindName("ScanBar")!=null)throw new Exception("Floating status height or bar-free layout mismatch");
+    CheckStatusLayout("sync");
     passed.Add("file_bytes_percentage_speed_and_activity");Capture("tray-preview-active.png");
+    double shortHeight=panel.ActualHeight;
+    var activityScroll=Find<ScrollViewer>("ActivityScroll");
+    var sampleActivity=Rows(Value(fixture,"activity")).First();
+    RenderActivities(Enumerable.Repeat(sampleActivity,20));panel.UpdateLayout();
+    if(panel.ActualHeight<=shortHeight || panel.ActualHeight>panel.MaxHeight+1 || activityScroll.ScrollableHeight<=0)
+     throw new Exception("Long activity list must scroll inside the work area");
+    activityScroll.ScrollToEnd();panel.UpdateLayout();
+    if(activityScroll.VerticalOffset<=0)throw new Exception("Cannot reach older activity");
+    RenderActivities(Rows(Value(fixture,"activity")).Reverse());panel.UpdateLayout();
+    if(Math.Abs(panel.ActualHeight-shortHeight)>1 || activityScroll.ScrollableHeight>0)throw new Exception("Short activity list did not shrink");
+    passed.Add("activity_panel_resizes_and_scrolls");
     var resumeFile=new Dictionary<string,object>{{"name","工作资料/大型归档.zip"},{"direction","upload"},{"size",67108864},{"bytes",16777216},{"saved_bytes",16777216},{"speed",0},{"phase","verifying"},{"progress_source","backend"},{"progress_confirmed",false}};
     var resumeProgress=new Dictionary<string,object>{{"active",new object[]{resumeFile}},{"speed",999999999}};
     Render(Map(Value(fixture,"active")),resumeProgress,Value(fixture,"activity"));panel.UpdateLayout();
-    if(Label("StatusTitle").Text!="正在校验 · 上次 25%" || Find<Border>("StatusCard").ActualHeight!=statusHeight)throw new Exception("Saved verification progress mismatch");
+    if(Label("StatusTitle").Text!="正在校验 · 上次 25%" || Find<Button>("StatusCard").ActualHeight!=statusHeight)throw new Exception("Saved verification progress mismatch");
     passed.Add("verification_keeps_previous_percentage_and_one_line");Capture("tray-preview-resume-checking.png");
     resumeFile["phase"]="resuming";resumeFile["progress_confirmed"]=true;
     Render(Map(Value(fixture,"active")),resumeProgress,Value(fixture,"activity"));
     if(Label("StatusTitle").Text!="正在续传 · 25%")throw new Exception("Resume restarted at zero or used local transfer speed");
     resumeFile["bytes"]=25165824;resumeFile["speed"]=2097152;
     Render(Map(Value(fixture,"active")),resumeProgress,Value(fixture,"activity"));panel.UpdateLayout();
-    if(Label("StatusTitle").Text!="正在续传 · 38% · 2.00 MiB/s" || Find<Border>("StatusCard").ActualHeight!=statusHeight || Label("StatusTitle").TextWrapping!=TextWrapping.NoWrap)throw new Exception("Resumed progress layout mismatch");
+    if(Label("StatusTitle").Text!="正在续传 · 38% · 2.00 MiB/s" || Find<Button>("StatusCard").ActualHeight!=statusHeight)throw new Exception("Resumed progress layout mismatch");
     passed.Add("resuming_uses_confirmed_progress_and_preserves_height");Capture("tray-preview-resuming.png");
     resumeFile["phase"]="verifying";resumeFile["bytes"]=67108864;resumeFile["speed"]=0;
     Render(Map(Value(fixture,"active")),resumeProgress,Value(fixture,"activity"));
@@ -400,7 +468,8 @@ namespace TwoDrive {
     passed.Add("final_verification_retains_100_percent");
     resumeFile["bytes"]=16777216;resumeFile["phase"]="resuming";
     Render(Map(Value(fixture,"paused")),resumeProgress,Value(fixture,"activity"));panel.UpdateLayout();
-    if(Label("StatusTitle").Text!="同步已暂停 · 25%" || Find<Border>("StatusCard").ActualHeight!=statusHeight || statusSpinning)throw new Exception("Paused checkpoint layout mismatch");
+    if(Label("StatusTitle").Text!="同步已暂停 · 25%" || Find<Button>("StatusCard").ActualHeight!=statusHeight || statusSpinning)throw new Exception("Paused checkpoint layout mismatch");
+    CheckStatusLayout("paused");
     passed.Add("paused_checkpoint_keeps_percentage_and_height");Capture("tray-preview-paused-checkpoint.png");
     Render(new Dictionary<string,object>{{"state","stopping"}},resumeProgress,Value(fixture,"activity"));
     if(Find<Button>("SyncButton").IsEnabled || Find<Button>("PauseButton").IsEnabled || Label("StatusTitle").Text!="正在暂停同步")throw new Exception("Pause transition allows premature resume");
@@ -409,14 +478,15 @@ namespace TwoDrive {
     Find<Button>("PauseButton").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));if(lastCommand!="pause")throw new Exception("Pause action mismatch");passed.Add("pause_button");
     Render(Map(Value(fixture,"paused")),new Dictionary<string,object>(),Value(fixture,"activity"));
     Find<Button>("PauseButton").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));if(lastCommand!="resume")throw new Exception("Resume action mismatch");passed.Add("resume_button");Capture("tray-preview-paused.png");
-    Render(Map(Value(fixture,"error")),new Dictionary<string,object>(),Value(fixture,"activity"));if(Label("StatusTitle").Text!="同步遇到问题")throw new Exception("Error hidden");passed.Add("error_state");Capture("tray-preview-error.png");
-    if(Find<Button>("IssuesButton").Visibility!=Visibility.Visible)throw new Exception("Error has no visible action");
-    Find<Button>("IssuesButton").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+    Render(Map(Value(fixture,"error")),new Dictionary<string,object>(),Value(fixture,"activity"));if(Label("StatusTitle").Text!="同步遇到问题")throw new Exception("Error hidden");
+    CheckStatusLayout("error");passed.Add("error_state");Capture("tray-preview-error.png");
+    if(!Find<Button>("StatusCard").IsEnabled)throw new Exception("Error icon cannot open issues");
+    Find<Button>("StatusCard").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
     if(settings==null||!settings.IsVisible||SF<StackPanel>("SyncPage").Visibility!=Visibility.Visible)throw new Exception("Issue action did not open sync settings");
     settings.Close();panel.Show();focusTaskIssues=false;passed.Add("error_action_opens_sync_settings");
     var retry=new Dictionary<string,object>{{"state","retrying"},{"message","网络连接暂时不可用"},{"retry_seconds",30},{"retry_at",DateTimeOffset.Now.AddSeconds(30).ToString("o")}};
     Render(retry,resumeProgress,Value(fixture,"activity"));panel.UpdateLayout();
-    if(!Label("StatusTitle").Text.Contains("00:30 后重试") || Label("PauseLabel").Text!="暂停同步" || Find<Border>("StatusCard").ActualHeight!=statusHeight)throw new Exception("Retry countdown or fixed row mismatch");
+    if(!Label("StatusTitle").Text.Contains("00:30 后重试") || Label("PauseLabel").Text!="暂停同步" || Find<Button>("StatusCard").ActualHeight!=statusHeight)throw new Exception("Retry countdown or fixed row mismatch");
     Find<Button>("PauseButton").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));if(lastCommand!="pause")throw new Exception("Retry cannot be paused");
     Find<Button>("SyncButton").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));if(lastCommand!="sync-now")throw new Exception("Retry cannot be requested immediately");
     passed.Add("retry_countdown_pause_and_immediate_retry");Capture("tray-preview-retrying.png");
@@ -428,16 +498,20 @@ namespace TwoDrive {
     if(!Label("StatusTitle").Text.Contains("00:20 后重试") || PauseCommand()!="pause")throw new Exception("Legacy worker retry state mismatch");
     passed.Add("retry_countdown_expiry_and_legacy_worker");
     Render(Map(Value(fixture,"checking")),Map(Value(fixture,"scan_progress")),Value(fixture,"activity"));panel.UpdateLayout();
-    if(!Label("StatusTitle").Text.Contains("7") || !((TextBlock)Label("StatusTitle").ToolTip).Text.Contains("图片") || Find<Border>("StatusCard").ActualHeight!=statusHeight || (SystemParameters.ClientAreaAnimation&&!statusSpinning))throw new Exception("Fixed-height animated scan status mismatch");
+    if(!Label("StatusTitle").Text.Contains("7") || !Label("StatusDetail").Text.Contains("图片") || Find<Button>("StatusCard").ActualHeight!=statusHeight || (SystemParameters.ClientAreaAnimation&&!statusSpinning))throw new Exception("Fixed-height animated scan status mismatch");
     passed.Add("scan_spinner_and_fixed_status_height");Capture("tray-preview-checking.png");
     Render(Map(Value(fixture,"idle")),new Dictionary<string,object>(),Value(fixture,"activity"));panel.UpdateLayout();
-    if(Find<Border>("StatusCard").ActualHeight!=statusHeight || statusSpinning || statusRotation.HasAnimatedProperties)throw new Exception("Idle status height or animation mismatch");
+    if(Find<Button>("StatusCard").ActualHeight!=statusHeight || statusSpinning || statusRotation.HasAnimatedProperties)throw new Exception("Idle status height or animation mismatch");
+    CheckStatusLayout("idle");passed.Add("four_hollow_glyphs_centered_above_sync");
     passed.Add("idle_same_height_and_animation_stops");Capture("tray-preview-idle.png");
-    if(Find<Button>("IssuesButton").Visibility!=Visibility.Collapsed)throw new Exception("Resolved issue action still visible");
+    if(Find<Button>("StatusCard").IsEnabled)throw new Exception("Resolved issue icon still opens issues");
     var timeState=new Dictionary<string,object>{{"state","idle"},{"last_check_at",DateTimeOffset.Now.ToString("o")},{"last_sync_at",DateTimeOffset.Now.AddHours(-1).ToString("o")},{"last_transfer_at",DateTimeOffset.Now.AddHours(-2).ToString("o")}};
     Render(timeState,new Dictionary<string,object>(),Value(fixture,"activity"));panel.UpdateLayout();
     string timeDetail=Convert.ToString(Label("LastSyncLabel").ToolTip);
     if(!Label("LastSyncLabel").Text.StartsWith("最近检查 ") || !timeDetail.Contains("同步成功：") || !timeDetail.Contains("文件传输：") || timeDetail.Contains("尚无记录"))throw new Exception("Check/sync/transfer times were conflated");
+    timeState["task_mode"]=true;timeState["active_tasks"]=6;
+    Render(timeState,new Dictionary<string,object>(),null);
+    if(Label("StatusDetail").Text!=timeDetail || Label("StatusTitle").Text!="6 个任务已同步")throw new Exception("Idle hover details omitted task timing");
     passed.Add("independent_check_sync_transfer_times");Capture("tray-preview-times.png");
     Render(new Dictionary<string,object>{{"state","error"},{"message","云端存在重复名称"},{"requires_action",true}},new Dictionary<string,object>(),null);
     if(Label("StatusTitle").Text!="同步遇到问题" || Label("PauseLabel").Text!="暂停同步" || PauseCommand()!="pause")throw new Exception("Action-required state cannot pause for reauthorization");
@@ -454,12 +528,12 @@ namespace TwoDrive {
     var taskOperation=new Dictionary<string,object>{{"task_id","pictures"},{"task_name","图片"},{"phase","deleting"},{"name","截图/示例.png"},{"completed",18},{"total",75}};
     var taskProgress=new Dictionary<string,object>{{"active",new object[]{taskOperation}}};
     Render(taskModel,taskProgress,null);panel.UpdateLayout();
-    if(Label("StatusTitle").Text!="图片 · 正在同步删除 18/75" || Find<Border>("StatusCard").ActualHeight!=statusHeight)throw new Exception("Task deletion progress hidden or changed row height");
-    if(!((TextBlock)Label("StatusTitle").ToolTip).Text.Contains("截图/示例.png"))throw new Exception("Task operation file missing from details");
+    if(Label("StatusTitle").Text!="图片 · 正在同步删除 18/75" || Find<Button>("StatusCard").ActualHeight!=statusHeight)throw new Exception("Task deletion progress hidden or changed row height");
+    if(!Label("StatusDetail").Text.Contains("截图/示例.png"))throw new Exception("Task operation file missing from details");
     passed.Add("task_actual_delete_counts_and_file_visible");Capture("tray-preview-task-delete.png");
     taskOperation["phase"]="waiting_network";taskOperation["wait_reason"]="等待云端响应";
     Render(taskModel,taskProgress,null);
-    if(!Label("StatusTitle").Text.Contains("正在等待网络") || !((TextBlock)Label("StatusTitle").ToolTip).Text.Contains("等待云端响应"))throw new Exception("Task wait reason missing");
+    if(!Label("StatusTitle").Text.Contains("正在等待网络") || !Label("StatusDetail").Text.Contains("等待云端响应"))throw new Exception("Task wait reason missing");
     passed.Add("task_network_wait_is_distinct_from_scanning");
     taskOperation["phase"]="uploading";taskOperation.Remove("total");taskOperation.Remove("completed");taskOperation["size"]=100;taskOperation["bytes"]=75;
     Render(taskModel,taskProgress,null);
@@ -497,6 +571,9 @@ namespace TwoDrive {
    using(var mutex=new Mutex(true,name+(test?"-test":""),out first)) {
     if(!first){if(show||showSettings)try{using(var signal=EventWaitHandle.OpenExisting(name+"-show"))signal.Set();}catch{}return 0;}
     var application=new Application{ShutdownMode=ShutdownMode.OnExplicitShutdown};
+    application.Resources["ThemeAccent"]=Brush(ThemeColor);
+    application.Resources["UiFont"]=new FontFamily("Microsoft YaHei UI");
+    application.Resources["BrandFont"]=new FontFamily("Segoe UI");
     try {
      using(var tray=new TrayApp(root,test)) {
       application.MainWindow=tray.panel;tray.Listen(name+(test?"-test":"")+"-show");

@@ -22,7 +22,10 @@ namespace TwoDrive {
   bool settingsLegacyEnabled=true;
   string previewTarget="",qrKey="",settingsError="",folderResultVersion="";
   T SF<T>(string name) where T:class {return settings.FindName(name) as T;}
-  void Notice(string message) {SF<TextBlock>("SettingsNotice").Text=message;}
+  void Notice(string message) {
+   var notice=SF<TextBlock>("SettingsNotice");notice.Text=message;
+   notice.Visibility=String.IsNullOrEmpty(message)?Visibility.Collapsed:Visibility.Visible;
+  }
 
   Dictionary<string,object> DesktopInfo(LocalClient client) {
    var serializer=new JavaScriptSerializer();
@@ -63,6 +66,7 @@ namespace TwoDrive {
    panel.Hide();
    if(settings==null) {
     using(var stream=File.OpenRead(Path.Combine(root,"tray/Settings.xaml")))settings=(Window)XamlReader.Load(stream);
+    settings.Resources[typeof(System.Windows.Controls.Primitives.ScrollBar)]=panel.FindResource("VerticalScroll");
     settings.Icon=BrandImage();SF<Image>("SettingsBrandIcon").Source=settings.Icon;SF<Image>("AboutBrandIcon").Source=settings.Icon;
     settings.Closed+=(s,e)=>{if(settingsTimer!=null)settingsTimer.Stop();settings=null;};
     SF<Button>("SyncNav").Click+=(s,e)=>SettingsPage("Sync");
@@ -96,13 +100,12 @@ namespace TwoDrive {
    foreach(string name in new[]{"Sync","Account","About"}) {
     SF<StackPanel>(name+"Page").Visibility=name==page?Visibility.Visible:Visibility.Collapsed;
     var navigation=SF<Button>(name+"Nav");
-    navigation.Background=Brush(name==page?"#E8EFF6":"#F7F8FA");
-    navigation.Foreground=Brush(name==page?CloudBrand.Indigo:"#243247");
-    navigation.BorderBrush=name==page?Brush("#375F83"):Brushes.Transparent;
-    navigation.FontWeight=name==page?FontWeights.SemiBold:FontWeights.Normal;
+    System.Windows.Controls.Primitives.Selector.SetIsSelected(navigation,name==page);
    }
    SF<TextBlock>("SettingsTitle").Text=page=="Sync"?"同步与备份":page=="Account"?"账户":"关于";
-   SF<TextBlock>("SettingsSubtitle").Text=page=="Sync"?"统一管理同步文件夹、保留策略与启动偏好":page=="Account"?"连接你的 115 网盘":"115Drive · 自动双向同步";
+   var subtitle=SF<TextBlock>("SettingsSubtitle");
+   subtitle.Text=page=="Account"?"连接你的 115 网盘":"115Drive · 自动双向同步";
+   subtitle.Visibility=page=="Sync"?Visibility.Collapsed:Visibility.Visible;
    SF<ScrollViewer>("SettingsScroll").ScrollToTop();
   }
   async void RefreshSettings() {
@@ -142,7 +145,7 @@ namespace TwoDrive {
    SF<CheckBox>("StartupCheck").IsChecked=Value(info,"start_with_windows") as bool? ?? true;
    SF<TextBlock>("DataFolderLabel").Text="程序与数据位置：\n"+root;
    SF<TextBlock>("SyncStateLabel").Text=Retrying(status)?RetryTitle(status):Text(status,"state")=="idle"?"文件已同步":Text(status,"message");
-   SF<TextBlock>("SyncStateLabel").Foreground=Brush(Text(status,"state")=="error"?"#9B4539":"#596779");
+   SF<TextBlock>("SyncStateLabel").Foreground=Brush(TaskStateColor(Text(status,"state")));
    SF<Button>("SettingsPauseButton").Content=!Retrying(status)&&(Text(status,"state")=="paused"||(Text(status,"state")=="error"&&!Object.Equals(Value(status,"requires_action"),true)))?"启动任务":"暂停任务";
    SF<Button>("SettingsPauseButton").IsEnabled=settingsInitialized&&!settingsBusy;
    SF<TextBlock>("AccountStateLabel").Text=settingsInitialized?"已连接 · "+(taskModels.Length+(settingsLegacyEnabled?1:0))+" 个同步任务":"尚未连接，先确认同步位置，再扫码登录。";
@@ -171,7 +174,7 @@ namespace TwoDrive {
    SF<ProgressBar>("FolderProgress").Maximum=Math.Max(1,Number(change,"total_bytes"));SF<ProgressBar>("FolderProgress").Value=Number(change,"bytes");
    SF<Button>("CancelFolderButton").Visibility=moving&&(Value(change,"cancellable") as bool? ?? false)?Visibility.Visible:Visibility.Collapsed;
    if(moving)SF<Button>("ApplyFolderButton").IsEnabled=false;
-   Notice(!String.IsNullOrEmpty(settingsError)?settingsError:moving?"正在安全更改文件夹，等待完成或取消。":"同一账号 · 各任务独立同步与保留");
+   Notice(!String.IsNullOrEmpty(settingsError)?settingsError:moving?"正在安全更改文件夹，等待完成或取消。":"");
    renderingSettings=false;
   }
   void BrowseLocalFolder() {
@@ -221,6 +224,12 @@ namespace TwoDrive {
   void TestNativeSettings(List<string> passed) {
    Find<Button>("SettingsButton").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
    if(settings==null||!settings.IsVisible)throw new Exception("Native settings did not open");passed.Add("tray_gear_opens_native_settings");
+   var panelBrand=Label("BrandTitle");
+   var settingsBrand=SF<TextBlock>("BrandTitle");
+   if(!Label("StatusTitle").FontFamily.Equals(settings.FontFamily) || !Label("PauseLabel").FontFamily.Equals(settings.FontFamily) ||
+      !panelBrand.FontFamily.Equals(settingsBrand.FontFamily) || panelBrand.FontWeight!=settingsBrand.FontWeight)
+    throw new Exception("Tray typography differs from Settings");
+   passed.Add("tray_and_settings_use_matching_fonts");
    var retryInfo=new Dictionary<string,object>{{"local_path",Text(Read("config.json"),"local_path")},{"initialized",true},{"start_with_windows",true}};
    var retryState=new Dictionary<string,object>{{"state","retrying"},{"message","网络连接暂时不可用"},{"retry_at",DateTimeOffset.Now.AddSeconds(60).ToString("o")},{"retry_seconds",60}};
    Render(retryState,new Dictionary<string,object>(),null);RenderSettings(retryInfo,retryState,new Dictionary<string,object>());

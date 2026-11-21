@@ -59,7 +59,8 @@ public static class FolderBadgeAssets {
                             float scale=Math.Min(size/(float)original.Width,size/(float)original.Height);
                             float w=original.Width*scale,h=original.Height*scale;
                             g.DrawImage(original,new RectangleF((size-w)/2,(size-h)/2,w,h));
-                            using(var mark=TwoDrive.CloudBrand.Render(128,"app"))
+                            int markSize=Math.Max(16,(int)Math.Round(size*.44));
+                            using(var mark=TwoDrive.CloudBrand.Render(markSize,"app"))
                                 g.DrawImage(mark,new RectangleF(size*.56f,size*.58f,size*.44f,size*.44f));
                         }
                         using(var png=new MemoryStream()){bitmap.Save(png,ImageFormat.Png);images.Add(png.ToArray());}

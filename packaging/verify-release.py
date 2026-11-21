@@ -55,7 +55,7 @@ def main():
         source_audit.content(names[2],(release/names[2]).read_bytes())
         assert source_audit.report()['ok'],source_audit.report()
         for name in ['README.md','PRIVACY.md','THIRD_PARTY_NOTICES.md','tray/Panel.xaml','tray/Settings.xaml',
-                     'register-shell-menu.ps1','register-sync-root.ps1','register-account-navigation.ps1','register-folder-badge.ps1','installer-process.ps1','tray/keep-local.ico','tray/free-space.ico','tray/115Drive-folder.ico',
+                     'register-shell-menu.ps1','register-sync-root.ps1','register-account-navigation.ps1','sync-navigation-layout.ps1','register-folder-badge.ps1','installer-process.ps1','tray/keep-local.ico','tray/free-space.ico','tray/115Drive-folder.ico',
                      'third_party/OpenList-4.2.6-twodrive-source.zip','third_party/OpenList-Frontend-v4.2.6-source.zip']:
             assert portable.read(name)==source.read(name),'Source/package mismatch: '+name
         assert 'tray/FolderBadge.dll' in files, 'Missing native folder badge helper'

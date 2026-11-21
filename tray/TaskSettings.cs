@@ -53,46 +53,108 @@ namespace TwoDrive {
    SF<ComboBox>("NewTaskPolicy").SelectedIndex=0;
    SF<ScrollViewer>("SettingsScroll").ScrollToTop();
   }
-  Grid TaskPaths(string local,string cloud) {
-   var grid=new Grid{Margin=new Thickness(0,12,0,0)};
-   grid.ColumnDefinitions.Add(new ColumnDefinition{Width=new GridLength(42)});grid.ColumnDefinitions.Add(new ColumnDefinition());
-   foreach(string path in new[]{local,cloud}) {
-    int row=grid.RowDefinitions.Count;grid.RowDefinitions.Add(new RowDefinition{Height=GridLength.Auto});
-    var label=new TextBlock{Text=row==0?"本地":"云端",Style=(Style)settings.FindResource("Note"),Margin=new Thickness(0,row==0?0:5,0,0)};
-    var value=new TextBlock{Text=path,ToolTip=path,TextWrapping=TextWrapping.Wrap,Margin=label.Margin};
-    Grid.SetRow(label,row);Grid.SetRow(value,row);Grid.SetColumn(value,1);grid.Children.Add(label);grid.Children.Add(value);
+  static string TaskStateColor(string state) {
+   switch(state) {
+    case "idle": case "ready": return "#227150";
+    case "error": case "retrying": return "#A53841";
+    case "checking": case "syncing": case "uploading": case "downloading": return ThemeColor;
+    default: return "#536B80";
    }
-   return grid;
+  }
+  static string TaskStateLabel(string state,bool paused) {
+   if(paused&&state!="paused"&&state!="error")return "正在暂停";
+   switch(state) {
+    case "idle": return "已同步";
+    case "ready": return "就绪";
+    case "paused": return "已暂停";
+    case "error": return "需要处理";
+    case "retrying": return "等待重试";
+    case "checking": return "核对中";
+    case "uploading": return "上传中";
+    case "downloading": return "下载中";
+    case "syncing": return "同步中";
+    default: return "等待处理";
+   }
+  }
+  static T RowPart<T>(Border row,string name) where T:FrameworkElement {return (T)row.FindName(name);}
+  static MenuItem TaskAction(Border row,string tag) {
+   return RowPart<Button>(row,"MoreTask").ContextMenu.Items.OfType<MenuItem>().Single(item=>Equals(item.Tag,tag));
+  }
+  void RunTaskAction(Border row,string action) {
+   if(settingsBusy)return;
+   var task=Map(row.DataContext);
+   string id=Text(task,"id");bool paused=Object.Equals(Value(task,"paused"),true);
+   switch(action) {
+    case "open": Launch(Text(task,"local_path"));break;
+    case "policy": EditTask(task);break;
+    case "toggle": SettingsCommand(paused?"tasks/resume":"tasks/pause",new{revision=taskRevision,id=id});break;
+    case "delete":
+     if(paused&&Text(Map(Value(task,"status")),"state")=="paused")
+      SettingsCommand("tasks/delete",new{revision=taskRevision,id=id});
+     break;
+   }
+  }
+  Border CreateTaskRow() {
+   var row=(Border)((DataTemplate)settings.FindResource("SyncFolderRow")).LoadContent();
+   RowPart<Button>(row,"OpenTask").Click+=(s,e)=>RunTaskAction(row,"open");
+   RowPart<Button>(row,"RowPolicy").Click+=(s,e)=>RunTaskAction(row,"policy");
+   var more=RowPart<Button>(row,"MoreTask");
+   more.Click+=(s,e)=>{more.ContextMenu.PlacementTarget=more;more.ContextMenu.IsOpen=true;};
+   foreach(var item in more.ContextMenu.Items.OfType<MenuItem>())
+    item.Click+=(s,e)=>RunTaskAction(row,(string)((MenuItem)s).Tag);
+   return row;
+  }
+  void RenderTaskRow(Border row,Dictionary<string,object> task,bool last) {
+   row.DataContext=task;row.Uid=Text(task,"id");
+   var status=Map(Value(task,"status"));string state=Text(status,"state"),message=Text(status,"message");
+   bool paused=Object.Equals(Value(task,"paused"),true),issue=state=="error"||state=="retrying";
+   row.Tag=issue;row.BorderThickness=new Thickness(0,0,0,last?0:1);
+   string name=Text(task,"name"),local=Text(task,"local_path"),cloud=Text(task,"cloud_path");
+   var title=RowPart<TextBlock>(row,"RowTitle");title.Text=name;title.ToolTip=name;
+   var paths=RowPart<Grid>(row,"RowPaths");paths.ToolTip="本地  "+local+"\n云端  "+cloud;
+   RowPart<TextBlock>(row,"LocalPathText").Text="本地  "+local;
+   RowPart<TextBlock>(row,"CloudPathText").Text="云端  "+cloud;
+   var label=RowPart<TextBlock>(row,"StateText");label.Text=TaskStateLabel(state,paused);
+   label.Foreground=Brush(TaskStateColor(paused&&state!="error"?"paused":state));
+   RowPart<System.Windows.Shapes.Ellipse>(row,"StateDot").Fill=label.Foreground;
+   RowPart<StackPanel>(row,"RowState").ToolTip=String.IsNullOrEmpty(message)?label.Text:message;
+   var reason=RowPart<TextBlock>(row,"RowIssue");reason.Text=message;
+   reason.Visibility=issue&&!String.IsNullOrEmpty(message)?Visibility.Visible:Visibility.Collapsed;
+   var open=RowPart<Button>(row,"OpenTask");open.ToolTip="打开文件夹 · "+local;
+   var policy=RowPart<Button>(row,"RowPolicy");policy.Content=Text(task,"policy")=="always_keep"?"始终保留":"仅联机";
+   var more=RowPart<Button>(row,"MoreTask");
+   System.Windows.Automation.AutomationProperties.SetName(open,"打开文件夹 · "+name);
+   System.Windows.Automation.AutomationProperties.SetName(policy,"保留策略 · "+name+" · "+policy.Content);
+   System.Windows.Automation.AutomationProperties.SetName(more,"更多操作 · "+name);
+   System.Windows.Automation.AutomationProperties.SetHelpText(more,Convert.ToString(paths.ToolTip));
+   TaskAction(row,"toggle").Header=paused?"启动任务":"暂停任务";
+   var remove=TaskAction(row,"delete");remove.IsEnabled=paused&&state=="paused";
+   remove.ToolTip=remove.IsEnabled?"解除同步，保留网盘文件和已下载的本机文件。":"请先暂停任务，等待暂停完成后再删除。";
   }
   void RenderTasks(Dictionary<string,object> data) {
    taskRevision=(int)Number(data,"revision");taskModels=Rows(Value(data,"tasks")).ToArray();
    SF<TextBlock>("TaskCountLabel").Text=settingsInitialized?(taskModels.Length+(settingsLegacyEnabled?1:0))+" 个":"尚未连接";
-   string key=json.Serialize(data);if(key==taskRenderKey){FocusTaskIssue();return;}taskRenderKey=key;
-   var cards=SF<StackPanel>("TaskCards");cards.Children.Clear();
-   string error=Text(data,"error");
-   if(!String.IsNullOrEmpty(error))cards.Children.Add(new TextBlock{Text=error,TextWrapping=TextWrapping.Wrap,Foreground=Brush("#9B4539"),Margin=new Thickness(0,0,0,16)});
-   foreach(var model in taskModels) {
-    var task=model;string id=Text(task,"id");bool paused=Value(task,"paused") as bool? ?? true;
-    var body=new StackPanel();var status=Map(Value(task,"status"));
-    var heading=new DockPanel();
-    var badge=new Border{Style=(Style)settings.FindResource("PolicyBadge"),Child=new TextBlock{Text=Text(task,"policy")=="always_keep"?"始终保留":"仅联机",Foreground=Brush("#375F83"),FontSize=11}};
-    DockPanel.SetDock(badge,Dock.Right);heading.Children.Add(badge);heading.Children.Add(new TextBlock{Text=Text(task,"name"),Style=(Style)settings.FindResource("TaskTitle")});
-    body.Children.Add(heading);body.Children.Add(TaskPaths(Text(task,"local_path"),Text(task,"cloud_path")));
-    string message=Text(status,"message");
-    body.Children.Add(new TextBlock{Text=String.IsNullOrEmpty(message)?(paused?"已暂停":"等待启动"):message,Style=(Style)settings.FindResource("Note"),Foreground=Brush(Text(status,"state")=="error"?"#9B4539":"#596779"),Margin=new Thickness(0,10,0,0)});
-    var actions=new WrapPanel{Margin=new Thickness(0,12,0,0)};
-    var pause=new Button{Content=paused?"启动任务":"暂停任务"};pause.Click+=(s,e)=>SettingsCommand(paused?"tasks/resume":"tasks/pause",new{revision=taskRevision,id=id});
-    var edit=new Button{Content="保留策略"};edit.Click+=(s,e)=>EditTask(task);
-    var open=new Button{Content="打开文件夹"};open.Click+=(s,e)=>Launch(Text(task,"local_path"));
-    bool canDelete=paused&&Text(status,"state")=="paused";
-    var remove=new Button{Content="删除任务",Style=(Style)settings.FindResource("TaskDeleteButton"),IsEnabled=canDelete,
-     ToolTip=canDelete?"解除同步并保留网盘文件、已下载的本机文件及同步历史；仅联机占位条目从本机移除，无需下载。":"请先暂停任务，等待暂停完成后再删除。"};
-    ToolTipService.SetShowOnDisabled(remove,true);
-    System.Windows.Automation.AutomationProperties.SetName(remove,"删除同步任务 · "+Text(task,"name"));
-    remove.Click+=(s,e)=>{if(remove.IsEnabled&&!settingsBusy)SettingsCommand("tasks/delete",new{revision=taskRevision,id=id});};
-    foreach(var button in new[]{open,edit,pause,remove}){button.Margin=new Thickness(0,0,8,6);actions.Children.Add(button);}body.Children.Add(actions);
-    body.Children.Add(new TextBlock{Text="云端保留替换和删除历史，占用网盘空间。",Style=(Style)settings.FindResource("Note"),FontSize=11,LineHeight=17,Margin=new Thickness(0,4,0,0)});
-    cards.Children.Add(new Border{Style=(Style)settings.FindResource("Card"),Child=body,Tag=Text(status,"state")=="error"});
+   string key=settingsInitialized+"|"+settingsLegacyEnabled+"|"+json.Serialize(data);
+   if(key==taskRenderKey){FocusTaskIssue();return;}taskRenderKey=key;
+   var cards=SF<StackPanel>("TaskCards");
+   string error=Text(data,"error");var info=SF<TextBlock>("TaskListMessage");
+   info.Text=!String.IsNullOrEmpty(error)?error:taskModels.Length==0&&!settingsLegacyEnabled&&settingsInitialized?"还没有同步文件夹":"";
+   info.Foreground=Brush(!String.IsNullOrEmpty(error)?"#A53841":"#516578");
+   info.Visibility=String.IsNullOrEmpty(info.Text)?Visibility.Collapsed:Visibility.Visible;
+   SF<Border>("TaskListFrame").Visibility=taskModels.Length==0?Visibility.Collapsed:Visibility.Visible;
+   // Reuse the controls so two-second status refreshes preserve focus and open menus.
+   var existing=cards.Children.OfType<Border>().ToDictionary(row=>row.Uid);
+   for(int i=0;i<taskModels.Length;i++) {
+    var task=taskModels[i];Border row;
+    if(!existing.TryGetValue(Text(task,"id"),out row))row=CreateTaskRow();
+    int previous=cards.Children.IndexOf(row);
+    if(previous!=i){if(previous>=0)cards.Children.RemoveAt(previous);cards.Children.Insert(i,row);}
+    RenderTaskRow(row,task,i==taskModels.Length-1);
+   }
+   while(cards.Children.Count>taskModels.Length){
+    var stale=(Border)cards.Children[cards.Children.Count-1];
+    RowPart<Button>(stale,"MoreTask").ContextMenu.IsOpen=false;
+    cards.Children.Remove(stale);
    }
    FocusTaskIssue();
   }
@@ -119,21 +181,27 @@ namespace TwoDrive {
    if(SF<TextBlock>("SettingsTitle").Text!="同步与备份"||SF<Border>("LegacyTaskCard").Visibility!=Visibility.Visible)throw new Exception("Old task entry does not reach unified sync page");
    passed.Add("unified_sync_navigation_and_legacy_task");
    CaptureSettings("settings-preview-tasks.png");
-   var first=(StackPanel)((Border)SF<StackPanel>("TaskCards").Children[0]).Child;
-   var actions=first.Children.OfType<WrapPanel>().Single();((Button)actions.Children[2]).RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+   var first=(Border)SF<StackPanel>("TaskCards").Children[0];
+   var more=RowPart<Button>(first,"MoreTask");
+   more.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+   if(!more.ContextMenu.IsOpen)throw new Exception("Task actions menu failed to open");
+   RenderTasks(new Dictionary<string,object>{{"revision",8},{"tasks",tasks}});
+   if(!more.ContextMenu.IsOpen||SF<StackPanel>("TaskCards").Children[0]!=first)throw new Exception("Refresh replaced active task menu");
+   more.ContextMenu.IsOpen=false;
+   TaskAction(first,"toggle").RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
    if(lastCommand!="tasks/pause")throw new Exception("Independent task pause failed");
-   var second=(StackPanel)((Border)SF<StackPanel>("TaskCards").Children[1]).Child;
-   var removeRunning=(Button)actions.Children[3];
-   var removePaused=(Button)second.Children.OfType<WrapPanel>().Single().Children[3];
+   var second=(Border)SF<StackPanel>("TaskCards").Children[1];
+   var removeRunning=TaskAction(first,"delete");
+   var removePaused=TaskAction(second,"delete");
    if(removeRunning.IsEnabled||!removePaused.IsEnabled||removeRunning.Foreground.ToString()!=Brush("#7B8490").ToString()||removePaused.Foreground.ToString()!=Brush("#B3261E").ToString())throw new Exception("Task delete enablement/colors failed");
-   string beforeDelete=lastCommand;removeRunning.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+   string beforeDelete=lastCommand;removeRunning.RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
    if(lastCommand!=beforeDelete)throw new Exception("Running task delete dispatched");
-   removePaused.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+   removePaused.RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
    if(lastCommand!="tasks/delete")throw new Exception("Paused task delete command failed");
    passed.Add("task_delete_disabled_gray_running_enabled_red_paused");
-   var start=(Button)second.Children.OfType<WrapPanel>().Single().Children[2];start.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
-   if(lastCommand!="tasks/resume"||Convert.ToString(start.Content)!="启动任务")throw new Exception("Independent task start failed");
-   ((Button)actions.Children[1]).RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+   var start=TaskAction(second,"toggle");start.RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
+   if(lastCommand!="tasks/resume"||Convert.ToString(start.Header)!="启动任务")throw new Exception("Independent task start failed");
+   RowPart<Button>(first,"RowPolicy").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
    SF<TextBox>("TaskCacheHours").Text="48";SF<Button>("SaveTaskPolicy").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
    if(lastCommand!="tasks/preferences")throw new Exception("Task policy save failed");
    SF<TextBox>("TaskOverridePath").Text="资料/重要.pdf";SF<ComboBox>("TaskOverridePolicy").SelectedIndex=1;
@@ -158,8 +226,12 @@ namespace TwoDrive {
    RenderTasks(new Dictionary<string,object>{{"revision",8},{"tasks",tasks}});SettingsPage("Sync");settings.UpdateLayout();
    var scroll=SF<ScrollViewer>("SettingsScroll");
    if(scroll.ScrollableHeight<=0||scroll.ExtentWidth>scroll.ViewportWidth+1)throw new Exception("Narrow settings layout cannot scroll without horizontal overflow");
-   var smallCard=(StackPanel)((Border)SF<StackPanel>("TaskCards").Children[0]).Child;
-   foreach(Button button in smallCard.Children.OfType<WrapPanel>().Single().Children)if(button.ActualWidth<=0||button.ActualWidth>scroll.ViewportWidth)throw new Exception("Task action clipped at minimum width");
+   var smallCard=(Border)SF<StackPanel>("TaskCards").Children[0];
+   foreach(string part in new[]{"OpenTask","RowPolicy","MoreTask"}){
+    var button=RowPart<Button>(smallCard,part);double left=button.TranslatePoint(new Point(),scroll).X;
+    if(button.ActualWidth<=0||left<0||left+button.ActualWidth>scroll.ViewportWidth+1)throw new Exception("Task action clipped at minimum width");
+   }
+   if(!Convert.ToString(RowPart<Grid>(smallCard,"RowPaths").ToolTip).Contains(Text(longTask,"local_path"))||RowPart<TextBlock>(smallCard,"CloudPathText").ActualWidth<40)throw new Exception("Full path missing at minimum width");
    ((FrameworkElement)SF<StackPanel>("TaskCards").Children[0]).BringIntoView();CaptureSettings("settings-preview-tasks-narrow.png");
    passed.Add("unified_tasks_small_window_scroll_and_actions");
    var retired=new Dictionary<string,object>{{"initialized",true},{"legacy_enabled",false},{"local_path","F:\\115Drive"},{"sync_tasks",new Dictionary<string,object>{{"revision",9},{"tasks",tasks}}}};
@@ -169,26 +241,35 @@ namespace TwoDrive {
    CaptureSettings("settings-preview-retired.png");
    var stopping=(Dictionary<string,object>)tasks[1];stopping["status"]=new Dictionary<string,object>{{"state","checking"},{"message","正在暂停"}};
    RenderTasks(new Dictionary<string,object>{{"revision",10},{"tasks",tasks}});
-   var stoppingCard=(StackPanel)((Border)SF<StackPanel>("TaskCards").Children[1]).Child;
-   if(((Button)stoppingCard.Children.OfType<WrapPanel>().Single().Children[3]).IsEnabled)throw new Exception("Stopping task can be deleted prematurely");
+   var stoppingCard=(Border)SF<StackPanel>("TaskCards").Children[1];
+   if(TaskAction(stoppingCard,"delete").IsEnabled)throw new Exception("Stopping task can be deleted prematurely");
    TaskCommandCompleted("tasks/delete");
    if(SF<Border>("EditTaskPanel").Visibility!=Visibility.Collapsed||editingTask!="")throw new Exception("Deleted task editor remains open");
    passed.Add("task_delete_waits_for_worker_stop_and_closes_editor");
    var issueTasks=new List<object>();
-   for(int i=0;i<6;i++) {
+   for(int i=0;i<12;i++) {
     var item=new Dictionary<string,object>((Dictionary<string,object>)tasks[0]);
-    item["id"]=i.ToString();item["name"]=i==5?"需要检查的图片任务":"正常任务 "+i;
-    item["status"]=new Dictionary<string,object>{{"state",i==5?"error":"idle"},{"message",i==5?"云端目录身份变化，请检查目录位置。":"本轮文件核对完成"}};
+    item["id"]=i.ToString();item["name"]=i==11?"需要检查的图片任务":"正常任务 "+i;
+    item["status"]=new Dictionary<string,object>{{"state",i==11?"error":"idle"},{"message",i==11?"云端目录身份变化，请检查目录位置。":"本轮文件核对完成"}};
     issueTasks.Add(item);
    }
    focusTaskIssues=true;RenderTasks(new Dictionary<string,object>{{"revision",11},{"tasks",issueTasks.ToArray()}});
    settings.UpdateLayout();settings.Dispatcher.Invoke((Action)(()=>{}),System.Windows.Threading.DispatcherPriority.Render);
    if(focusTaskIssues||SF<ScrollViewer>("SettingsScroll").VerticalOffset<=0)throw new Exception("Issue action did not scroll to affected task");
-   var issueBody=(StackPanel)((Border)SF<StackPanel>("TaskCards").Children[5]).Child;
-   if(!issueBody.Children.OfType<TextBlock>().Any(t=>t.Text.Contains("云端目录身份变化")))throw new Exception("Issue reason missing from task card");
+   var issue=RowPart<TextBlock>((Border)SF<StackPanel>("TaskCards").Children[11],"RowIssue");
+   if(!issue.IsVisible||!issue.Text.Contains("云端目录身份变化"))throw new Exception("Issue reason missing from task card");
    CaptureSettings("settings-preview-issues.png");passed.Add("issue_action_locates_task_and_reason");
-   settingsLegacyEnabled=true;
    settings.Width=width;settings.Height=height;
+   string[] folderNames={"电子书","附件","软件安装包","图片","文件","音乐"};
+   var overview=folderNames.Select((name,i)=>new Dictionary<string,object>{{"id","fixture"+i},{"name",name},
+    {"local_path","F:\\"+name},{"cloud_path","/"+name},{"policy","always_keep"},{"paused",false},
+    {"status",new Dictionary<string,object>{{"state","idle"},{"message","本轮文件核对完成"}}}}).ToArray();
+   RenderTasks(new Dictionary<string,object>{{"revision",12},{"tasks",overview}});
+   SettingsPage("Sync");settings.UpdateLayout();
+   var last=(Border)SF<StackPanel>("TaskCards").Children[5];
+   if(last.TranslatePoint(new Point(0,last.ActualHeight),scroll).Y>scroll.ActualHeight+1)throw new Exception("Default overview does not show all six folders");
+   CaptureSettings("settings-six-folders.png");passed.Add("six_folders_visible_and_open_menu_survives_refresh");
+   settingsLegacyEnabled=true;
    SF<Border>("AddTaskPanel").Visibility=Visibility.Collapsed;SF<Border>("EditTaskPanel").Visibility=Visibility.Collapsed;
   }
  }
